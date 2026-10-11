@@ -1,15 +1,30 @@
 const std = @import("std");
 const Io = std.Io;
 
+comptime {
+    if (@sizeOf(usize) != 8 or @sizeOf(isize) != 8) {
+        @compileError("VM requires a 64-bit target");
+    }
+}
+
 const StackSize = 1 << 10; // TODO
 const Value = usize;
 
-fn boxInt(n: i32) Value {
-    const bits: usize = @bitCast(@as(isize, n));
+pub fn boxInt(n: isize) Value {
+    const bits: usize = @bitCast(n);
     return (bits << 1) | 1;
 }
 
-fn unboxInt(value: Value) isize {
+pub inline fn unboxIntUnchecked(value: Value) isize {
+    const signed: isize = @bitCast(value);
+    return signed >> 1;
+}
+
+pub inline fn unboxIntChecked(value: Value) !isize {
+    if ((value & 1) == 0) {
+        @branchHint(.unlikely);
+        return error.ExpectedInteger;
+    }
     const signed: isize = @bitCast(value);
     return signed >> 1;
 }
@@ -25,6 +40,14 @@ fn Stack(comptime T: type) type {
                 .len = 0,
                 .data = undefined,
             };
+        }
+
+        pub fn head(self: *Self) !T {
+            if (self.len == 0) {
+                @branchHint(.unlikely);
+                return error.StackUnderfloor;
+            }
+            return self.data[self.len - 1];
         }
 
         pub fn push(self: *Self, element: T) !void {
@@ -79,6 +102,7 @@ pub const VM = struct {
 
     current_line: ?i32,
 
+    alloc: std.mem.Allocator,
     io: std.Io,
 
     pub inline fn ensureEnoughBytes(self: *Self, need: usize) !void {
@@ -108,9 +132,37 @@ pub const VM = struct {
         while (true) {
             const opcode = try self.readByte();
             switch (opcode) {
+                // TODO: optimize some operations inplace
+                0x01 => {
+                    const right = try unboxIntChecked(try self.stack.pop());
+                    const left = try unboxIntChecked(try self.stack.pop());
+                    try self.stack.push(boxInt(left +% right));
+                },
+                0x02 => {
+                    const right = try unboxIntChecked(try self.stack.pop());
+                    const left = try unboxIntChecked(try self.stack.pop());
+                    try self.stack.push(boxInt(left -% right));
+                },
+                0x03 => {
+                    const right = try unboxIntChecked(try self.stack.pop());
+                    const left = try unboxIntChecked(try self.stack.pop());
+                    try self.stack.push(boxInt(left *% right));
+                },
                 0x52 => {
                     const args_count = try self.readI32();
                     const locals_count = try self.readI32();
+
+                    if (args_count < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeArgsCount;
+                    }
+                    if (locals_count < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeLocalsCount;
+                    }
+
+                    self.frame.locals = try self.alloc.alloc(Value, @intCast(locals_count));
+                    self.frame.args = try self.alloc.alloc(Value, @intCast(args_count));
 
                     std.debug.print("BEGIN args={d} locals={d}\n", .{
                         args_count, locals_count,
@@ -127,16 +179,84 @@ pub const VM = struct {
                 0x16 => {
                     return;
                 },
+                0x18 => {
+                    _ = try self.stack.pop();
+                },
+
+                0x19 => {
+                    const value = try self.stack.head();
+                    try self.stack.push(value);
+                },
+                0x1A => {
+                    const right = try self.stack.pop();
+                    const left = try self.stack.pop();
+
+                    try self.stack.push(right);
+                    try self.stack.push(left);
+                },
+                0x20 => {
+                    const idx = try self.readI32();
+                    if (idx < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeGlobalIndex;
+                    }
+                    const udx: usize = @intCast(idx);
+                    if (udx >= self.globals.len) {
+                        @branchHint(.unlikely);
+                        return error.GlobalIndexOverflow;
+                    }
+                    try self.stack.push(self.globals[udx]);
+                },
+                0x21 => {
+                    const idx = try self.readI32();
+                    if (idx < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeLocalIndex;
+                    }
+                    const udx: usize = @intCast(idx);
+                    if (udx >= self.frame.locals.len) {
+                        @branchHint(.unlikely);
+                        return error.LocalIndexOverflow;
+                    }
+                    try self.stack.push(self.frame.locals[udx]);
+                },
+                0x40 => {
+                    const idx = try self.readI32();
+                    if (idx < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeGlobalIndex;
+                    }
+                    const udx: usize = @intCast(idx);
+                    if (udx >= self.globals.len) {
+                        @branchHint(.unlikely);
+                        return error.GlobalIndexOverflow;
+                    }
+                    self.globals[udx] = try self.stack.head();
+                },
+                0x41 => {
+                    const idx = try self.readI32();
+                    if (idx < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeLocalIndex;
+                    }
+                    const udx: usize = @intCast(idx);
+                    if (udx >= self.frame.locals.len) {
+                        @branchHint(.unlikely);
+                        return error.LocalIndexOverflow;
+                    }
+                    self.frame.locals[udx] = try self.stack.head();
+                },
                 0x71 => {
                     const value = try self.stack.pop();
                     if ((value & 1) == 0) {
+                        @branchHint(.unlikely);
                         return error.ExpectedInteger;
                     }
                     var buffer: [64]u8 = undefined;
                     const text = try std.fmt.bufPrint(
                         &buffer,
                         "{d}\n",
-                        .{unboxInt(value)},
+                        .{try unboxIntChecked(value)},
                     );
                     try std.Io.File.stdout().writeStreamingAll(self.io, text);
                     try self.stack.push(0);
@@ -240,6 +360,7 @@ pub fn main(init: std.process.Init) !void {
             .closure = &.{},
             .stack_base = 0,
         },
+        .alloc = init.arena.allocator(),
     };
     @memset(vm.globals, 0);
     try vm.run();
