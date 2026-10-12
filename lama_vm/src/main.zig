@@ -103,7 +103,7 @@ fn markInstructionStarts(alloc: std.mem.Allocator, code: []const u8) ![]bool {
         }
 
         const size: usize = switch (code[offset]) {
-            0x01...0x03, 0x06...0x0B, 0x16, 0x18...0x1A, 0x71 => 1,
+            0x01...0x03, 0x06...0x0B, 0x16, 0x17, 0x18...0x1A, 0x71, 0x04, 0x05, 0x0C, 0x0D, 0x70 => 1,
             0x10, 0x15, 0x20, 0x21, 0x22, 0x40, 0x41, 0x42, 0x50, 0x51, 0x5A => 5,
             0x52, 0x56 => 9,
             else => return error.InvalidOpcode,
@@ -134,6 +134,45 @@ pub const VM = struct {
 
     alloc: std.mem.Allocator,
     io: std.Io,
+    input_data: ?[]const u8 = null,
+    input_pos: usize = 0,
+
+    pub fn readInputInteger(self: *Self) !isize {
+        if (self.input_data == null) {
+            var reader = std.Io.File.stdin().readerStreaming(self.io, &.{});
+            self.input_data = reader.interface.allocRemaining(self.alloc, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
+                error.ReadFailed => return reader.err.?,
+                error.StreamTooLong => return error.InputTooLarge,
+                else => return err,
+            };
+        }
+        const input = self.input_data.?;
+        while (self.input_pos < input.len and std.ascii.isWhitespace(input[self.input_pos])) {
+            self.input_pos += 1;
+        }
+        if (self.input_pos == input.len) {
+            return error.UnexpectedEndOfInput;
+        }
+
+        const start = self.input_pos;
+        while (self.input_pos < input.len and !std.ascii.isWhitespace(input[self.input_pos])) {
+            self.input_pos += 1;
+        }
+        const token = input[start..self.input_pos];
+        const digits = if (token[0] == '+' or token[0] == '-') token[1..] else token;
+        if (digits.len == 0) {
+            return error.InvalidIntegerInput;
+        }
+        for (digits) |digit| {
+            if (!std.ascii.isDigit(digit)) {
+                return error.InvalidIntegerInput;
+            }
+        }
+        return std.fmt.parseInt(i63, token, 10) catch |err| switch (err) {
+            error.InvalidCharacter => return error.InvalidIntegerInput,
+            error.Overflow => return error.InputIntegerOutOfRange,
+        };
+    }
 
     pub inline fn ensureEnoughBytes(self: *Self, need: usize) !void {
         if (need > self.code.len - self.ip) {
@@ -168,6 +207,20 @@ pub const VM = struct {
         }
     }
 
+    pub fn stackPop(self: *Self) !Value {
+        if (self.stack.len <= self.frame.stack_base) {
+            return error.StackUnderflow;
+        }
+        return try self.stack.pop();
+    }
+
+    pub fn stackHead(self: *Self) !Value {
+        if (self.stack.len <= self.frame.stack_base) {
+            return error.StackUnderflow;
+        }
+        return try self.stack.head();
+    }
+
     pub fn run(self: *Self) !void {
         // TODO: next() in cycle
         while (true) {
@@ -175,49 +228,76 @@ pub const VM = struct {
             switch (opcode) {
                 // TODO: optimize some operations inplace
                 0x01 => {
-                    const right = try unboxIntChecked(try self.stack.pop());
-                    const left = try unboxIntChecked(try self.stack.pop());
+                    const right = try unboxIntChecked(try self.stackPop());
+                    const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(left +% right));
                 },
                 0x02 => {
-                    const right = try unboxIntChecked(try self.stack.pop());
-                    const left = try unboxIntChecked(try self.stack.pop());
+                    const right = try unboxIntChecked(try self.stackPop());
+                    const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(left -% right));
                 },
                 0x03 => {
-                    const right = try unboxIntChecked(try self.stack.pop());
-                    const left = try unboxIntChecked(try self.stack.pop());
+                    const right = try unboxIntChecked(try self.stackPop());
+                    const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(left *% right));
                 },
+
+                0x04 => {
+                    const right = try unboxIntChecked(try self.stackPop());
+                    const left = try unboxIntChecked(try self.stackPop());
+                    if (right == 0) {
+                        return error.DivisionByZero;
+                    }
+                    try self.stack.push(boxInt(@divTrunc(left, right)));
+                },
+                0x05 => {
+                    const right = try unboxIntChecked(try self.stackPop());
+                    const left = try unboxIntChecked(try self.stackPop());
+                    if (right == 0) {
+                        return error.DivisionByZero;
+                    }
+                    try self.stack.push(boxInt(@rem(left, right)));
+                },
                 0x06 => {
-                    const right = try unboxIntChecked(try self.stack.pop());
-                    const left = try unboxIntChecked(try self.stack.pop());
+                    const right = try unboxIntChecked(try self.stackPop());
+                    const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(@intFromBool(left < right)));
                 },
                 0x07 => {
-                    const right = try unboxIntChecked(try self.stack.pop());
-                    const left = try unboxIntChecked(try self.stack.pop());
+                    const right = try unboxIntChecked(try self.stackPop());
+                    const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(@intFromBool(left <= right)));
                 },
                 0x08 => {
-                    const right = try unboxIntChecked(try self.stack.pop());
-                    const left = try unboxIntChecked(try self.stack.pop());
+                    const right = try unboxIntChecked(try self.stackPop());
+                    const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(@intFromBool(left > right)));
                 },
                 0x09 => {
-                    const right = try unboxIntChecked(try self.stack.pop());
-                    const left = try unboxIntChecked(try self.stack.pop());
+                    const right = try unboxIntChecked(try self.stackPop());
+                    const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(@intFromBool(left >= right)));
                 },
                 0x0A => {
-                    const right = try unboxIntChecked(try self.stack.pop());
-                    const left = try unboxIntChecked(try self.stack.pop());
+                    const right = try unboxIntChecked(try self.stackPop());
+                    const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(@intFromBool(left == right)));
                 },
                 0x0B => {
-                    const right = try unboxIntChecked(try self.stack.pop());
-                    const left = try unboxIntChecked(try self.stack.pop());
+                    const right = try unboxIntChecked(try self.stackPop());
+                    const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(@intFromBool(left != right)));
+                },
+                0x0C => {
+                    const right = try unboxIntChecked(try self.stackPop());
+                    const left = try unboxIntChecked(try self.stackPop());
+                    try self.stack.push(boxInt(@intFromBool((left != 0) and (right != 0))));
+                },
+                0x0D => {
+                    const right = try unboxIntChecked(try self.stackPop());
+                    const left = try unboxIntChecked(try self.stackPop());
+                    try self.stack.push(boxInt(@intFromBool((left != 0) or (right != 0))));
                 },
                 0x15 => {
                     const addr = try self.readI32();
@@ -253,7 +333,7 @@ pub const VM = struct {
                         @branchHint(.unlikely);
                         return error.ArgumentIndexOutOfBounds;
                     }
-                    self.frame.args[udx] = try self.stack.head();
+                    self.frame.args[udx] = try self.stackHead();
                 },
                 0x50 => {
                     const addr = try self.readI32();
@@ -263,7 +343,7 @@ pub const VM = struct {
                     }
                     const uaddr: usize = @intCast(addr);
                     try self.CheckAddress(uaddr);
-                    if (0 == try unboxIntChecked(try self.stack.pop())) {
+                    if (0 == try unboxIntChecked(try self.stackPop())) {
                         self.ip = uaddr;
                     }
                 },
@@ -275,7 +355,7 @@ pub const VM = struct {
                     }
                     const uaddr: usize = @intCast(addr);
                     try self.CheckAddress(uaddr);
-                    if (0 != try unboxIntChecked(try self.stack.pop())) {
+                    if (0 != try unboxIntChecked(try self.stackPop())) {
                         self.ip = uaddr;
                     }
                 },
@@ -292,10 +372,19 @@ pub const VM = struct {
                         return error.NegativeLocalCount;
                     }
 
-                    self.frame.locals = try self.alloc.alloc(Value, @intCast(locals_count));
-                    self.frame.args = try self.alloc.alloc(Value, @intCast(args_count));
+                    const uargs_count: usize = @intCast(args_count);
+                    const ulocals_count: usize = @intCast(locals_count);
 
-                    @memset(self.frame.args, 0);
+                    if (self.call_stack.len == 0) {
+                        self.frame.args = try self.alloc.alloc(Value, uargs_count);
+                        @memset(self.frame.args, 0);
+                    } else {
+                        if (uargs_count != self.frame.args.len) {
+                            return error.ArgumentCountMismatch;
+                        }
+                    }
+
+                    self.frame.locals = try self.alloc.alloc(Value, ulocals_count);
                     @memset(self.frame.locals, 0);
 
                     std.debug.print("BEGIN args={d} locals={d}\n", .{
@@ -348,25 +437,53 @@ pub const VM = struct {
                     if (self.call_stack.len >= self.call_stack.data.len) {
                         return error.CallStackOverflow;
                     }
+
+                    var new_frame: Frame = undefined;
+                    new_frame.args = try self.alloc.alloc(Value, uargs_cnt);
+                    for (0..uargs_cnt) |idx| {
+                        new_frame.args[uargs_cnt - 1 - idx] = try self.stackPop();
+                    }
+                    const saved = SavedFrame{ .frame = self.frame, .return_ip = self.ip };
+                    try self.call_stack.push(saved);
+
+                    new_frame.locals = &.{};
+                    new_frame.closure = &.{};
+                    new_frame.stack_base = self.stack.len;
+
+                    self.frame = new_frame;
+                    self.ip = uaddr;
                 },
                 0x10 => {
                     const element = try self.readI32();
                     try self.stack.push(boxInt(element));
                 },
-                0x16 => {
-                    return;
+                0x16, 0x17 => {
+                    if (self.call_stack.len == 0) {
+                        return;
+                    }
+                    const last_frame = try self.call_stack.pop();
+                    var possibleReturnValue: ?Value = null;
+                    if (self.stack.len > self.frame.stack_base) {
+                        possibleReturnValue = try self.stackPop();
+                    }
+                    self.stack.len = self.frame.stack_base;
+                    self.ip = last_frame.return_ip;
+                    self.frame = last_frame.frame;
+                    if (possibleReturnValue) |v| {
+                        try self.stack.push(v);
+                    }
                 },
                 0x18 => {
-                    _ = try self.stack.pop();
+                    _ = try self.stackPop();
                 },
 
                 0x19 => {
-                    const value = try self.stack.head();
+                    const value = try self.stackHead();
                     try self.stack.push(value);
                 },
                 0x1A => {
-                    const right = try self.stack.pop();
-                    const left = try self.stack.pop();
+                    const right = try self.stackPop();
+                    const left = try self.stackPop();
 
                     try self.stack.push(right);
                     try self.stack.push(left);
@@ -408,7 +525,7 @@ pub const VM = struct {
                         @branchHint(.unlikely);
                         return error.GlobalIndexOutOfBounds;
                     }
-                    self.globals[udx] = try self.stack.head();
+                    self.globals[udx] = try self.stackHead();
                 },
                 0x41 => {
                     const idx = try self.readI32();
@@ -421,10 +538,13 @@ pub const VM = struct {
                         @branchHint(.unlikely);
                         return error.LocalIndexOutOfBounds;
                     }
-                    self.frame.locals[udx] = try self.stack.head();
+                    self.frame.locals[udx] = try self.stackHead();
+                },
+                0x70 => {
+                    try self.stack.push(boxInt(try self.readInputInteger()));
                 },
                 0x71 => {
-                    const value = try self.stack.pop();
+                    const value = try self.stackPop();
                     if ((value & 1) == 0) {
                         @branchHint(.unlikely);
                         return error.ExpectedInteger;
