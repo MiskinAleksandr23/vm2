@@ -7,6 +7,9 @@ comptime {
     }
 }
 
+extern fn LtagHash(name: [*:0]const u8) i64;
+extern fn de_hash(tag: i64) [*:0]const u8;
+
 const StackSize = 1 << 10; // TODO
 const Value = usize;
 
@@ -108,9 +111,9 @@ fn markInstructionStarts(alloc: std.mem.Allocator, code: []const u8) ![]bool {
         }
 
         const size: usize = switch (code[offset]) {
-            0x01...0x03, 0x06...0x0B, 0x16, 0x17, 0x18...0x1A, 0x71, 0x04, 0x05, 0x0C, 0x0D, 0x70, 0x72, 0x1B, 0x14, 0x13 => 1,
-            0x10, 0x15, 0x20, 0x21, 0x22, 0x40, 0x41, 0x42, 0x50, 0x51, 0x5A, 0x11, 0x74, 0x30, 0x31, 0x32 => 5,
-            0x52, 0x56 => 9,
+            0x01...0x03, 0x06...0x0B, 0x16, 0x17, 0x18...0x1A, 0x71, 0x04, 0x05, 0x0C, 0x0D, 0x70, 0x72, 0x1B, 0x14, 0x13, 0x73, 0x64, 0x65, 0x60, 0x61, 0x62, 0x63, 0x66 => 1,
+            0x10, 0x15, 0x20, 0x21, 0x22, 0x40, 0x41, 0x42, 0x50, 0x51, 0x5A, 0x11, 0x74, 0x30, 0x31, 0x32, 0x58 => 5,
+            0x52, 0x56, 0x12, 0x57, 0x59 => 9,
             else => return error.InvalidOpcode,
         };
         if (size > code.len - offset) {
@@ -258,6 +261,73 @@ pub const VM = struct {
         return &values[index];
     }
 
+    pub fn appendValueText(self: *Self, value: Value, buff: *std.ArrayList(u8), path: *std.ArrayList(Value)) anyerror!void {
+        if ((value & 1) != 0) {
+            const number = try unboxIntChecked(value);
+            var buffer: [32]u8 = undefined;
+            const bytes = try std.fmt.bufPrint(&buffer, "{d}", .{number});
+            try buff.appendSlice(self.alloc, bytes);
+        } else {
+            const header = try self.objectHeaderChecked(value);
+            const tag = header.data_header & 7;
+            if (tag == 1) {
+                const length = header.data_header >> 3;
+                const data: [*]const u8 = @ptrFromInt(value);
+                try buff.append(self.alloc, '"');
+                try buff.appendSlice(self.alloc, data[0..length]);
+                try buff.append(self.alloc, '"');
+            } else if (tag == 3) {
+                if (std.mem.findScalar(Value, path.items, value) != null) {
+                    return error.CyclicValue;
+                }
+                if (path.items.len >= 256) {
+                    return error.StringConversionTooDeep;
+                }
+                try path.append(self.alloc, value);
+                defer path.items.len -= 1;
+
+                const length = header.data_header >> 3;
+                const data: [*]const Value = @ptrFromInt(value);
+                try buff.append(self.alloc, '[');
+                for (0..length) |i| {
+                    if (i != 0) {
+                        try buff.appendSlice(self.alloc, ", ");
+                    }
+                    try self.appendValueText(data[i], buff, path);
+                }
+                try buff.append(self.alloc, ']');
+            } else if (tag == 5) {
+                const constructor_tag: *const usize = @ptrFromInt(value);
+                const id = constructor_tag.*;
+                const name = std.mem.span(de_hash(@intCast(id)));
+                try buff.appendSlice(self.alloc, name);
+
+                const count = header.data_header >> 3;
+                if (std.mem.findScalar(Value, path.items, value) != null) {
+                    return error.CyclicValue;
+                }
+                if (path.items.len >= 256) {
+                    return error.StringConversionTooDeep;
+                }
+                try path.append(self.alloc, value);
+                defer path.items.len -= 1;
+                if (count > 0) {
+                    try buff.appendSlice(self.alloc, " (");
+                    const data: [*]const Value = @ptrFromInt(value + 8);
+                    for (0..count) |idx| {
+                        if (idx != 0) {
+                            try buff.appendSlice(self.alloc, ", ");
+                        }
+                        try self.appendValueText(data[idx], buff, path);
+                    }
+                    try buff.append(self.alloc, ')');
+                }
+            } else {
+                return error.UnsupportedStringConversion;
+            }
+        }
+    }
+
     pub fn referenceChecked(self: *Self, ref: Value) !*Value {
         const current = [_][]Value{
             self.globals,
@@ -352,6 +422,53 @@ pub const VM = struct {
                     const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(@intFromBool(left >= right)));
                 },
+                0x12 => {
+                    const offset = try self.readI32();
+                    const count = try self.readI32();
+
+                    if (offset < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeStringOffset;
+                    }
+                    const uoffset: usize = @intCast(offset);
+                    if (uoffset >= self.strings.len) {
+                        return error.StringOffsetOutOfBounds;
+                    }
+                    const tail = self.strings[uoffset..];
+                    const end = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
+                    const constructor_name = tail[0..end];
+
+                    if (count < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeSexpFieldCount;
+                    }
+                    const ucount: usize = @intCast(count);
+                    if (self.stack.len < self.frame.stack_base or
+                        ucount > self.stack.len - self.frame.stack_base)
+                    {
+                        @branchHint(.unlikely);
+                        return error.StackUnderflow;
+                    }
+                    const name = try self.alloc.dupeZ(u8, constructor_name);
+                    const encoded: Value = @intCast(LtagHash(name.ptr));
+                    const tag = try unboxIntChecked(encoded);
+
+                    const buff = try self.alloc.alignedAlloc(u8, std.mem.Alignment.of(ObjectHeader), 24 + ucount * 8);
+
+                    const header: *ObjectHeader = @ptrCast(buff.ptr);
+                    header.data_header = (ucount << 3) | 5;
+                    header.forward_address = 0;
+
+                    const constructor_tag: *usize = @ptrCast(@alignCast(buff.ptr + 16));
+                    constructor_tag.* = @intCast(tag);
+                    const elements: [*]Value = @ptrCast(@alignCast(buff.ptr + 24));
+                    for (0..ucount) |i| {
+                        elements[ucount - 1 - i] = try self.stackPop();
+                    }
+                    const object = @intFromPtr(buff.ptr + @sizeOf(ObjectHeader));
+                    try self.objects.append(self.alloc, object);
+                    try self.stack.push(object);
+                },
                 0x11 => {
                     const offset = try self.readI32();
                     if (offset < 0) {
@@ -375,7 +492,7 @@ pub const VM = struct {
                     const tag = header.data_header & 7;
                     const length = header.data_header >> 3;
 
-                    if (tag == 1 or tag == 3) {
+                    if (tag == 1 or tag == 3 or tag == 5) {
                         @branchHint(.likely);
                         try self.stack.push(boxInt(@intCast(length)));
                     } else {
@@ -410,6 +527,25 @@ pub const VM = struct {
                     try self.objects.append(self.alloc, object);
                     try self.stack.push(object);
                 },
+                0x58 => {
+                    const args_cnt = try self.readI32();
+                    if (args_cnt < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeArrayLength;
+                    }
+                    const uargs_cnt: usize = @intCast(args_cnt);
+                    const value = try self.stackPop();
+
+                    var matches = false;
+
+                    if (std.mem.findScalar(Value, self.objects.items, value) != null) {
+                        const header = try self.objectHeaderChecked(value);
+                        matches = ((header.data_header & 7) == 3) and
+                            ((header.data_header >> 3) == uargs_cnt);
+                    }
+
+                    try self.stack.push(boxInt(@intFromBool(matches)));
+                },
 
                 0x1B => {
                     const index = try unboxIntChecked(try self.stackPop());
@@ -424,7 +560,7 @@ pub const VM = struct {
                     const tag = header.data_header & 7;
                     const length = header.data_header >> 3;
 
-                    if (tag != 1 and tag != 3) {
+                    if (tag != 1 and tag != 3 and tag != 5) {
                         return error.ExpectedStringOrArray;
                     }
 
@@ -440,8 +576,9 @@ pub const VM = struct {
                         const elements: [*]const Value = @ptrFromInt(object);
                         const value = elements[uindex];
                         try self.stack.push(value);
-                    } else {
-                        unreachable;
+                    } else if (tag == 5) {
+                        const elements: [*]const Value = @ptrFromInt(object + @sizeOf(Value));
+                        try self.stack.push(elements[uindex]);
                     }
                 },
                 0x14 => {
@@ -465,7 +602,7 @@ pub const VM = struct {
                     const tag = header.data_header & 7;
                     const length = header.data_header >> 3;
 
-                    if (tag != 1 and tag != 3) {
+                    if (tag != 1 and tag != 3 and tag != 5) {
                         return error.ExpectedStringOrArray;
                     }
 
@@ -486,8 +623,10 @@ pub const VM = struct {
                         const elements: [*]Value = @ptrFromInt(object);
                         elements[uindex] = new_value;
                         try self.stack.push(new_value);
-                    } else {
-                        unreachable;
+                    } else if (tag == 5) {
+                        const elements: [*]Value = @ptrFromInt(object + @sizeOf(Value));
+                        elements[uindex] = new_value;
+                        try self.stack.push(new_value);
                     }
                 },
                 0x30 => {
@@ -536,9 +675,15 @@ pub const VM = struct {
                     try self.stack.push(new_value);
                 },
                 0x0A => {
-                    const right = try unboxIntChecked(try self.stackPop());
-                    const left = try unboxIntChecked(try self.stackPop());
-                    try self.stack.push(boxInt(@intFromBool(left == right)));
+                    const right = try self.stackPop();
+                    const left = try self.stackPop();
+                    if ((left & 1) == 1 and (right & 1) == 1) {
+                        try self.stack.push(boxInt(@intFromBool(left == right)));
+                    } else if ((left & 1) == 1 or (right & 1) == 1) {
+                        try self.stack.push(boxInt(0));
+                    } else {
+                        return error.ExpectedInteger;
+                    }
                 },
                 0x0B => {
                     const right = try unboxIntChecked(try self.stackPop());
@@ -709,6 +854,132 @@ pub const VM = struct {
                     self.frame = new_frame;
                     self.ip = uaddr;
                 },
+                0x57 => {
+                    const offset = try self.readI32();
+                    const count = try self.readI32();
+
+                    if (offset < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeStringOffset;
+                    }
+                    if (count < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeSexpFieldCount;
+                    }
+                    const uoffset: usize = @intCast(offset);
+                    const ucount: usize = @intCast(count);
+
+                    if (uoffset >= self.strings.len) {
+                        return error.StringOffsetOutOfBounds;
+                    }
+
+                    const tail = self.strings[uoffset..];
+                    const end = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
+
+                    const constructor_name = tail[0..end];
+                    const name = try self.alloc.dupeZ(u8, constructor_name);
+                    const encoded: Value = @intCast(LtagHash(name.ptr));
+                    const tag = try unboxIntChecked(encoded);
+                    const value = try self.stackPop();
+
+                    var matches = false;
+                    if (std.mem.findScalar(Value, self.objects.items, value) != null) {
+                        const header = try self.objectHeaderChecked(value);
+                        if ((header.data_header & 7) == 5) {
+                            const constructor_tag: *const usize = @ptrFromInt(value);
+                            const expected_tag: usize = @intCast(tag);
+
+                            matches = ((header.data_header >> 3) == ucount) and
+                                (constructor_tag.* == expected_tag);
+                        }
+                    }
+                    try self.stack.push(boxInt(@intFromBool(matches)));
+                },
+                0x60 => {
+                    const right = try self.stackPop();
+                    const left = try self.stackPop();
+
+                    var matches = false;
+                    if (std.mem.findScalar(Value, self.objects.items, left) != null and std.mem.findScalar(Value, self.objects.items, right) != null) {
+                        const header_l = try self.objectHeaderChecked(left);
+                        const header_r = try self.objectHeaderChecked(right);
+
+                        if ((header_l.data_header & 7) == 1 and
+                            (header_r.data_header & 7) == 1)
+                        {
+                            const data_l: [*]const u8 = @ptrFromInt(left);
+                            const data_r: [*]const u8 = @ptrFromInt(right);
+
+                            const bytes_l = data_l[0 .. header_l.data_header >> 3];
+                            const bytes_r = data_r[0 .. header_r.data_header >> 3];
+
+                            if (std.mem.eql(u8, bytes_l, bytes_r)) {
+                                matches = true;
+                            }
+                        }
+                    }
+                    try self.stack.push(boxInt(@intFromBool(matches)));
+                },
+                0x61 => {
+                    const value = try self.stackPop();
+                    var matches = false;
+
+                    if (std.mem.findScalar(Value, self.objects.items, value) != null) {
+                        const header = try self.objectHeaderChecked(value);
+                        matches = (header.data_header & 7) == 1;
+                    }
+                    try self.stack.push(boxInt(@intFromBool(matches)));
+                },
+                0x62 => {
+                    const value = try self.stackPop();
+                    var matches = false;
+
+                    if (std.mem.findScalar(Value, self.objects.items, value) != null) {
+                        const header = try self.objectHeaderChecked(value);
+                        matches = (header.data_header & 7) == 3;
+                    }
+                    try self.stack.push(boxInt(@intFromBool(matches)));
+                },
+                0x63 => {
+                    const value = try self.stackPop();
+                    var matches = false;
+
+                    if (std.mem.findScalar(Value, self.objects.items, value) != null) {
+                        const header = try self.objectHeaderChecked(value);
+                        matches = (header.data_header & 7) == 5;
+                    }
+                    try self.stack.push(boxInt(@intFromBool(matches)));
+                },
+                0x66 => {
+                    const value = try self.stackPop();
+                    var matches = false;
+
+                    if (std.mem.findScalar(Value, self.objects.items, value) != null) {
+                        const header = try self.objectHeaderChecked(value);
+                        matches = (header.data_header & 7) == 7;
+                    }
+                    try self.stack.push(boxInt(@intFromBool(matches)));
+                },
+                0x64 => {
+                    const value = try self.stackPop();
+                    try self.stack.push(boxInt(@intFromBool((value & 1) == 0)));
+                },
+                0x65 => {
+                    const value = try self.stackPop();
+                    try self.stack.push(boxInt(@intFromBool((value & 1) != 0)));
+                },
+                0x59 => {
+                    const row = try self.readI32();
+                    const column = try self.readI32();
+
+                    if (row < 0 or column < 0) {
+                        @branchHint(.unlikely);
+                        return error.InvalidSourceLocation;
+                    }
+                    _ = try self.stackHead();
+                    std.debug.print("Pattern matching failed: row = {d}, column = {d}\n", .{ row, column });
+                    return error.MatchFailure;
+                },
                 0x10 => {
                     const element = try self.readI32();
                     try self.stack.push(boxInt(element));
@@ -813,6 +1084,16 @@ pub const VM = struct {
                     );
                     try std.Io.File.stdout().writeStreamingAll(self.io, text);
                     try self.stack.push(0);
+                },
+                0x73 => {
+                    const value = try self.stackPop();
+                    var buff: std.ArrayList(u8) = .empty;
+                    defer buff.deinit(self.alloc);
+                    var path: std.ArrayList(Value) = .empty;
+                    defer path.deinit(self.alloc);
+                    try self.appendValueText(value, &buff, &path);
+                    const str = try self.createString(buff.items);
+                    try self.stack.push(str);
                 },
                 else => return error.InvalidOpcode,
             }
