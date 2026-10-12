@@ -10,7 +10,7 @@ comptime {
 extern fn LtagHash(name: [*:0]const u8) i64;
 extern fn de_hash(tag: i64) [*:0]const u8;
 
-const StackSize = 1 << 10; // TODO
+const StackSize = 1 << 15; // TODO
 const Value = usize;
 
 pub fn boxInt(n: isize) Value {
@@ -112,8 +112,14 @@ fn markInstructionStarts(alloc: std.mem.Allocator, code: []const u8) ![]bool {
 
         const size: usize = switch (code[offset]) {
             0x01...0x03, 0x06...0x0B, 0x16, 0x17, 0x18...0x1A, 0x71, 0x04, 0x05, 0x0C, 0x0D, 0x70, 0x72, 0x1B, 0x14, 0x13, 0x73, 0x64, 0x65, 0x60, 0x61, 0x62, 0x63, 0x66 => 1,
-            0x10, 0x15, 0x20, 0x21, 0x22, 0x40, 0x41, 0x42, 0x50, 0x51, 0x5A, 0x11, 0x74, 0x30, 0x31, 0x32, 0x58 => 5,
-            0x52, 0x56, 0x12, 0x57, 0x59 => 9,
+            0x10, 0x15, 0x20, 0x21, 0x22, 0x40, 0x41, 0x42, 0x50, 0x51, 0x5A, 0x11, 0x74, 0x30, 0x31, 0x32, 0x58, 0x23, 0x33, 0x43, 0x55 => 5,
+            0x52, 0x53, 0x56, 0x12, 0x57, 0x59 => 9,
+            0x54 => blk: {
+                if (code.len - offset < 9) return error.TruncatedInstruction;
+                const count = std.mem.readInt(i32, code[offset + 5 ..][0..4], .little);
+                if (count < 0) return error.NegativeClosureCaptureCount;
+                break :blk 9 + @as(usize, @intCast(count)) * 5;
+            },
             else => return error.InvalidOpcode,
         };
         if (size > code.len - offset) {
@@ -144,7 +150,7 @@ pub const VM = struct {
     io: std.Io,
     input_data: ?[]const u8 = null,
     input_pos: usize = 0,
-    objects: std.ArrayList(Value) = .empty,
+    objects: std.AutoHashMapUnmanaged(Value, void) = .empty,
 
     pub fn createString(self: *Self, bytes: []const u8) !Value {
         const size = @sizeOf(ObjectHeader) + bytes.len + 1;
@@ -158,7 +164,7 @@ pub const VM = struct {
         buff[@sizeOf(ObjectHeader) + bytes.len] = 0;
 
         const value = @intFromPtr(buff.ptr + @sizeOf(ObjectHeader));
-        try self.objects.append(self.alloc, value);
+        try self.objects.put(self.alloc, value, {});
         return value;
     }
 
@@ -333,6 +339,7 @@ pub const VM = struct {
             self.globals,
             self.frame.locals,
             self.frame.args,
+            self.frame.closure,
         };
         for (current) |values| {
             if (referenceInSlice(ref, values)) |ptr| {
@@ -344,6 +351,7 @@ pub const VM = struct {
             const values = [_][]Value{
                 saved.frame.locals,
                 saved.frame.args,
+                saved.frame.closure,
             };
             for (values) |slice| {
                 if (referenceInSlice(ref, slice)) |ptr| {
@@ -357,7 +365,7 @@ pub const VM = struct {
 
     pub fn objectHeaderChecked(self: *Self, value: Value) !*const ObjectHeader {
         if (value == 0 or (value & 1) != 0 or
-            std.mem.findScalar(Value, self.objects.items, value) == null)
+            !self.objects.contains(value))
         {
             return error.ExpectedStringOrArray;
         }
@@ -466,7 +474,7 @@ pub const VM = struct {
                         elements[ucount - 1 - i] = try self.stackPop();
                     }
                     const object = @intFromPtr(buff.ptr + @sizeOf(ObjectHeader));
-                    try self.objects.append(self.alloc, object);
+                    try self.objects.put(self.alloc, object, {});
                     try self.stack.push(object);
                 },
                 0x11 => {
@@ -524,7 +532,7 @@ pub const VM = struct {
                         value[ucnt - 1 - i] = try self.stackPop();
                     }
                     const object = @intFromPtr(buff.ptr) + @sizeOf(ObjectHeader);
-                    try self.objects.append(self.alloc, object);
+                    try self.objects.put(self.alloc, object, {});
                     try self.stack.push(object);
                 },
                 0x58 => {
@@ -538,7 +546,7 @@ pub const VM = struct {
 
                     var matches = false;
 
-                    if (std.mem.findScalar(Value, self.objects.items, value) != null) {
+                    if (self.objects.contains(value)) {
                         const header = try self.objectHeaderChecked(value);
                         matches = ((header.data_header & 7) == 3) and
                             ((header.data_header >> 3) == uargs_cnt);
@@ -760,7 +768,43 @@ pub const VM = struct {
                         self.ip = uaddr;
                     }
                 },
-                0x52 => {
+                0x23 => {
+                    const idx = try self.readI32();
+                    if (idx < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeClosureIndex;
+                    }
+                    const uidx: usize = @intCast(idx);
+                    if (uidx >= self.frame.closure.len) {
+                        return error.ClosureIndexOutOfBounds;
+                    }
+                    try self.stack.push(self.frame.closure[uidx]);
+                },
+                0x33 => {
+                    const idx = try self.readI32();
+                    if (idx < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeClosureIndex;
+                    }
+                    const uidx: usize = @intCast(idx);
+                    if (uidx >= self.frame.closure.len) {
+                        return error.ClosureIndexOutOfBounds;
+                    }
+                    try self.stack.push(@intFromPtr(&self.frame.closure[uidx]));
+                },
+                0x43 => {
+                    const idx = try self.readI32();
+                    if (idx < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeClosureIndex;
+                    }
+                    const uidx: usize = @intCast(idx);
+                    if (uidx >= self.frame.closure.len) {
+                        return error.ClosureIndexOutOfBounds;
+                    }
+                    self.frame.closure[uidx] = try self.stackHead();
+                },
+                0x52, 0x53 => {
                     const args_count = try self.readI32();
                     const locals_count = try self.readI32();
 
@@ -788,13 +832,143 @@ pub const VM = struct {
                     self.frame.locals = try self.alloc.alloc(Value, ulocals_count);
                     @memset(self.frame.locals, 0);
 
-                    std.debug.print("BEGIN args={d} locals={d}\n", .{
-                        args_count, locals_count,
-                    });
+                    // std.debug.print("BEGIN args={d} locals={d}\n", .{
+                    //     args_count, locals_count,
+                    // });
+                },
+                0x54 => {
+                    const addr = try self.readI32();
+                    const count = try self.readI32();
+
+                    if (addr < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeClosureAddress;
+                    }
+                    if (count < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeClosureCaptureCount;
+                    }
+                    const uaddr: usize = @intCast(addr);
+                    const ucount: usize = @intCast(count);
+
+                    try self.CheckAddress(uaddr);
+                    if (self.code[uaddr] != 0x52 and self.code[uaddr] != 0x53) {
+                        return error.ClosureTargetNotFunction;
+                    }
+
+                    const buff = try self.alloc.alignedAlloc(
+                        u8,
+                        std.mem.Alignment.of(ObjectHeader),
+                        24 + ucount * @sizeOf(Value),
+                    );
+
+                    const header: *ObjectHeader = @ptrCast(buff.ptr);
+                    header.data_header = ((ucount + 1) << 3) | 7;
+                    header.forward_address = 0;
+
+                    const function_addr: *usize = @ptrCast(@alignCast(buff.ptr + 16));
+                    function_addr.* = uaddr;
+
+                    const captures: [*]Value = @ptrCast(@alignCast(buff.ptr + 24));
+
+                    for (0..ucount) |idx| {
+                        const d = try self.readByte();
+                        const id = try self.readI32();
+                        if (id < 0) {
+                            @branchHint(.unlikely);
+                            return error.NegativeClosureCaptureIndex;
+                        }
+
+                        const ud: usize = @intCast(d);
+                        const uid: usize = @intCast(id);
+
+                        if (ud == 0) {
+                            if (uid >= self.globals.len) {
+                                @branchHint(.unlikely);
+                                return error.GlobalIndexOutOfBounds;
+                            }
+                            captures[idx] = self.globals[uid];
+                        } else if (ud == 1) {
+                            if (uid >= self.frame.locals.len) {
+                                @branchHint(.unlikely);
+                                return error.LocalIndexOutOfBounds;
+                            }
+                            captures[idx] = self.frame.locals[uid];
+                        } else if (ud == 2) {
+                            if (uid >= self.frame.args.len) {
+                                @branchHint(.unlikely);
+                                return error.ArgumentIndexOutOfBounds;
+                            }
+                            captures[idx] = self.frame.args[uid];
+                        } else if (ud == 3) {
+                            if (uid >= self.frame.closure.len) {
+                                @branchHint(.unlikely);
+                                return error.ClosureIndexOutOfBounds;
+                            }
+                            captures[idx] = self.frame.closure[uid];
+                        } else {
+                            return error.InvalidClosureCaptureScope;
+                        }
+                    }
+                    const object = @intFromPtr(buff.ptr + 16);
+                    try self.objects.put(self.alloc, object, {});
+                    try self.stack.push(object);
                 },
                 0x5A => {
                     const line = try self.readI32();
                     self.current_line = line;
+                },
+                0x55 => {
+                    const count = try self.readI32();
+                    if (count < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeArgumentCount;
+                    }
+                    const ucount: usize = @intCast(count);
+                    if (self.stack.len < self.frame.stack_base or
+                        ucount + 1 > self.stack.len - self.frame.stack_base)
+                    {
+                        return error.StackUnderflow;
+                    }
+                    if (self.call_stack.len >= self.call_stack.data.len) {
+                        return error.CallStackOverflow;
+                    }
+
+                    var new_frame: Frame = undefined;
+                    const args = try self.alloc.alloc(Value, ucount);
+                    for (0..ucount) |i| {
+                        args[ucount - 1 - i] = try self.stackPop();
+                    }
+
+                    const object = try self.stackPop();
+                    if (!self.objects.contains(object)) {
+                        return error.ExpectedClosure;
+                    }
+                    const header = try self.objectHeaderChecked(object);
+                    const length = header.data_header >> 3;
+                    if ((header.data_header & 7) != 7) return error.ExpectedClosure;
+                    if (length == 0) return error.InvalidClosure;
+                    const function_addr: *const usize = @ptrFromInt(object);
+                    const uaddr = function_addr.*;
+                    try self.CheckAddress(uaddr);
+                    if (self.code[uaddr] != 0x52 and self.code[uaddr] != 0x53) {
+                        return error.CallTargetNotFunction;
+                    }
+                    if (self.code.len - uaddr < 9) return error.TruncatedInstruction;
+                    const declared_args = std.mem.readInt(i32, self.code[uaddr + 1 ..][0..4], .little);
+                    if (declared_args < 0) return error.NegativeArgumentCount;
+                    if (count != declared_args) return error.ArgumentCountMismatch;
+
+                    const captures: [*]Value = @ptrFromInt(object + @sizeOf(Value));
+                    new_frame.args = args;
+                    new_frame.locals = &.{};
+                    new_frame.closure = captures[0 .. length - 1];
+                    new_frame.stack_base = self.stack.len;
+
+                    const saved = SavedFrame{ .frame = self.frame, .return_ip = self.ip };
+                    try self.call_stack.push(saved);
+                    self.frame = new_frame;
+                    self.ip = uaddr;
                 },
 
                 0x56 => {
@@ -883,7 +1057,7 @@ pub const VM = struct {
                     const value = try self.stackPop();
 
                     var matches = false;
-                    if (std.mem.findScalar(Value, self.objects.items, value) != null) {
+                    if (self.objects.contains(value)) {
                         const header = try self.objectHeaderChecked(value);
                         if ((header.data_header & 7) == 5) {
                             const constructor_tag: *const usize = @ptrFromInt(value);
@@ -900,7 +1074,7 @@ pub const VM = struct {
                     const left = try self.stackPop();
 
                     var matches = false;
-                    if (std.mem.findScalar(Value, self.objects.items, left) != null and std.mem.findScalar(Value, self.objects.items, right) != null) {
+                    if (self.objects.contains(left) and self.objects.contains(right)) {
                         const header_l = try self.objectHeaderChecked(left);
                         const header_r = try self.objectHeaderChecked(right);
 
@@ -924,7 +1098,7 @@ pub const VM = struct {
                     const value = try self.stackPop();
                     var matches = false;
 
-                    if (std.mem.findScalar(Value, self.objects.items, value) != null) {
+                    if (self.objects.contains(value)) {
                         const header = try self.objectHeaderChecked(value);
                         matches = (header.data_header & 7) == 1;
                     }
@@ -934,7 +1108,7 @@ pub const VM = struct {
                     const value = try self.stackPop();
                     var matches = false;
 
-                    if (std.mem.findScalar(Value, self.objects.items, value) != null) {
+                    if (self.objects.contains(value)) {
                         const header = try self.objectHeaderChecked(value);
                         matches = (header.data_header & 7) == 3;
                     }
@@ -944,7 +1118,7 @@ pub const VM = struct {
                     const value = try self.stackPop();
                     var matches = false;
 
-                    if (std.mem.findScalar(Value, self.objects.items, value) != null) {
+                    if (self.objects.contains(value)) {
                         const header = try self.objectHeaderChecked(value);
                         matches = (header.data_header & 7) == 5;
                     }
@@ -954,7 +1128,7 @@ pub const VM = struct {
                     const value = try self.stackPop();
                     var matches = false;
 
-                    if (std.mem.findScalar(Value, self.objects.items, value) != null) {
+                    if (self.objects.contains(value)) {
                         const header = try self.objectHeaderChecked(value);
                         matches = (header.data_header & 7) == 7;
                     }
@@ -1188,7 +1362,7 @@ pub fn main(init: std.process.Init) !void {
         if (!instruction_starts[addr]) {
             return error.PublicFunctionTargetNotInstructionStart;
         }
-        if (byteCode.code[addr] != 0x52) {
+        if (byteCode.code[addr] != 0x52 and byteCode.code[addr] != 0x53) {
             return error.PublicFunctionTargetNotFunction;
         }
     }
