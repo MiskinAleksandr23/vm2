@@ -45,7 +45,7 @@ fn Stack(comptime T: type) type {
         pub fn head(self: *Self) !T {
             if (self.len == 0) {
                 @branchHint(.unlikely);
-                return error.StackUnderfloor;
+                return error.StackUnderflow;
             }
             return self.data[self.len - 1];
         }
@@ -61,7 +61,7 @@ fn Stack(comptime T: type) type {
         pub fn pop(self: *Self) !T {
             if (self.len == 0) {
                 @branchHint(.unlikely);
-                return error.StackUnderfloor;
+                return error.StackUnderflow;
             }
             const element = self.data[self.len - 1];
             self.len -= 1;
@@ -88,9 +88,39 @@ const ByteCode = struct {
     globals_count: usize,
 };
 
+fn markInstructionStarts(alloc: std.mem.Allocator, code: []const u8) ![]bool {
+    const starts = try alloc.alloc(bool, code.len);
+    errdefer alloc.free(starts);
+    @memset(starts, false);
+
+    var offset: usize = 0;
+    while (offset < code.len) {
+        if (code[offset] == 0xFF) {
+            if (offset != code.len - 1) {
+                return error.TrailingBytesAfterBytecodeTerminator;
+            }
+            return starts;
+        }
+
+        const size: usize = switch (code[offset]) {
+            0x01...0x03, 0x06...0x0B, 0x16, 0x18...0x1A, 0x71 => 1,
+            0x10, 0x15, 0x20, 0x21, 0x22, 0x40, 0x41, 0x42, 0x50, 0x51, 0x5A => 5,
+            0x52, 0x56 => 9,
+            else => return error.InvalidOpcode,
+        };
+        if (size > code.len - offset) {
+            return error.TruncatedInstruction;
+        }
+        starts[offset] = true;
+        offset += size;
+    }
+    return error.MissingBytecodeTerminator;
+}
+
 pub const VM = struct {
     const Self = @This();
     code: []const u8,
+    instruction_starts: []const bool,
     strings: []const u8,
     ip: usize, // invariant: 0 <= ip <= code.len
 
@@ -128,7 +158,18 @@ pub const VM = struct {
         return value;
     }
 
+    pub inline fn CheckAddress(self: *Self, addr: usize) !void {
+        if (addr >= self.code.len) {
+            @branchHint(.unlikely);
+            return error.JumpAddressOutOfBounds;
+        }
+        if (!self.instruction_starts[addr]) {
+            return error.JumpTargetNotInstructionStart;
+        }
+    }
+
     pub fn run(self: *Self) !void {
+        // TODO: next() in cycle
         while (true) {
             const opcode = try self.readByte();
             switch (opcode) {
@@ -148,21 +189,114 @@ pub const VM = struct {
                     const left = try unboxIntChecked(try self.stack.pop());
                     try self.stack.push(boxInt(left *% right));
                 },
+                0x06 => {
+                    const right = try unboxIntChecked(try self.stack.pop());
+                    const left = try unboxIntChecked(try self.stack.pop());
+                    try self.stack.push(boxInt(@intFromBool(left < right)));
+                },
+                0x07 => {
+                    const right = try unboxIntChecked(try self.stack.pop());
+                    const left = try unboxIntChecked(try self.stack.pop());
+                    try self.stack.push(boxInt(@intFromBool(left <= right)));
+                },
+                0x08 => {
+                    const right = try unboxIntChecked(try self.stack.pop());
+                    const left = try unboxIntChecked(try self.stack.pop());
+                    try self.stack.push(boxInt(@intFromBool(left > right)));
+                },
+                0x09 => {
+                    const right = try unboxIntChecked(try self.stack.pop());
+                    const left = try unboxIntChecked(try self.stack.pop());
+                    try self.stack.push(boxInt(@intFromBool(left >= right)));
+                },
+                0x0A => {
+                    const right = try unboxIntChecked(try self.stack.pop());
+                    const left = try unboxIntChecked(try self.stack.pop());
+                    try self.stack.push(boxInt(@intFromBool(left == right)));
+                },
+                0x0B => {
+                    const right = try unboxIntChecked(try self.stack.pop());
+                    const left = try unboxIntChecked(try self.stack.pop());
+                    try self.stack.push(boxInt(@intFromBool(left != right)));
+                },
+                0x15 => {
+                    const addr = try self.readI32();
+                    if (addr < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeJumpAddress;
+                    }
+                    const uaddr: usize = @intCast(addr);
+                    try self.CheckAddress(uaddr);
+                    self.ip = uaddr;
+                },
+                0x22 => {
+                    const idx = try self.readI32();
+                    if (idx < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeArgumentIndex;
+                    }
+                    const udx: usize = @intCast(idx);
+                    if (udx >= self.frame.args.len) {
+                        @branchHint(.unlikely);
+                        return error.ArgumentIndexOutOfBounds;
+                    }
+                    try self.stack.push(self.frame.args[udx]);
+                },
+                0x42 => {
+                    const idx = try self.readI32();
+                    if (idx < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeArgumentIndex;
+                    }
+                    const udx: usize = @intCast(idx);
+                    if (udx >= self.frame.args.len) {
+                        @branchHint(.unlikely);
+                        return error.ArgumentIndexOutOfBounds;
+                    }
+                    self.frame.args[udx] = try self.stack.head();
+                },
+                0x50 => {
+                    const addr = try self.readI32();
+                    if (addr < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeJumpAddress;
+                    }
+                    const uaddr: usize = @intCast(addr);
+                    try self.CheckAddress(uaddr);
+                    if (0 == try unboxIntChecked(try self.stack.pop())) {
+                        self.ip = uaddr;
+                    }
+                },
+                0x51 => {
+                    const addr = try self.readI32();
+                    if (addr < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeJumpAddress;
+                    }
+                    const uaddr: usize = @intCast(addr);
+                    try self.CheckAddress(uaddr);
+                    if (0 != try unboxIntChecked(try self.stack.pop())) {
+                        self.ip = uaddr;
+                    }
+                },
                 0x52 => {
                     const args_count = try self.readI32();
                     const locals_count = try self.readI32();
 
                     if (args_count < 0) {
                         @branchHint(.unlikely);
-                        return error.NegativeArgsCount;
+                        return error.NegativeArgumentCount;
                     }
                     if (locals_count < 0) {
                         @branchHint(.unlikely);
-                        return error.NegativeLocalsCount;
+                        return error.NegativeLocalCount;
                     }
 
                     self.frame.locals = try self.alloc.alloc(Value, @intCast(locals_count));
                     self.frame.args = try self.alloc.alloc(Value, @intCast(args_count));
+
+                    @memset(self.frame.args, 0);
+                    @memset(self.frame.locals, 0);
 
                     std.debug.print("BEGIN args={d} locals={d}\n", .{
                         args_count, locals_count,
@@ -171,6 +305,49 @@ pub const VM = struct {
                 0x5A => {
                     const line = try self.readI32();
                     self.current_line = line;
+                },
+
+                0x56 => {
+                    const addr = try self.readI32();
+                    const args_cnt = try self.readI32();
+
+                    if (addr < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeJumpAddress;
+                    }
+                    const uaddr: usize = @intCast(addr);
+                    try self.CheckAddress(uaddr);
+
+                    if (args_cnt < 0) {
+                        @branchHint(.unlikely);
+                        return error.NegativeArgumentCount;
+                    }
+                    const uargs_cnt: usize = @intCast(args_cnt);
+                    if (self.code[uaddr] != 0x52) {
+                        return error.CallTargetNotFunction;
+                    }
+                    if (self.code.len - uaddr < 9) {
+                        return error.TruncatedInstruction;
+                    }
+                    const declared_args = std.mem.readInt(
+                        i32,
+                        self.code[uaddr + 1 ..][0..4],
+                        .little,
+                    );
+                    if (declared_args < 0) {
+                        return error.NegativeArgumentCount;
+                    }
+                    if (args_cnt != declared_args) {
+                        return error.ArgumentCountMismatch;
+                    }
+                    if (self.stack.len < self.frame.stack_base or
+                        uargs_cnt > self.stack.len - self.frame.stack_base)
+                    {
+                        return error.StackUnderflow;
+                    }
+                    if (self.call_stack.len >= self.call_stack.data.len) {
+                        return error.CallStackOverflow;
+                    }
                 },
                 0x10 => {
                     const element = try self.readI32();
@@ -203,7 +380,7 @@ pub const VM = struct {
                     const udx: usize = @intCast(idx);
                     if (udx >= self.globals.len) {
                         @branchHint(.unlikely);
-                        return error.GlobalIndexOverflow;
+                        return error.GlobalIndexOutOfBounds;
                     }
                     try self.stack.push(self.globals[udx]);
                 },
@@ -216,7 +393,7 @@ pub const VM = struct {
                     const udx: usize = @intCast(idx);
                     if (udx >= self.frame.locals.len) {
                         @branchHint(.unlikely);
-                        return error.LocalIndexOverflow;
+                        return error.LocalIndexOutOfBounds;
                     }
                     try self.stack.push(self.frame.locals[udx]);
                 },
@@ -229,7 +406,7 @@ pub const VM = struct {
                     const udx: usize = @intCast(idx);
                     if (udx >= self.globals.len) {
                         @branchHint(.unlikely);
-                        return error.GlobalIndexOverflow;
+                        return error.GlobalIndexOutOfBounds;
                     }
                     self.globals[udx] = try self.stack.head();
                 },
@@ -242,7 +419,7 @@ pub const VM = struct {
                     const udx: usize = @intCast(idx);
                     if (udx >= self.frame.locals.len) {
                         @branchHint(.unlikely);
-                        return error.LocalIndexOverflow;
+                        return error.LocalIndexOutOfBounds;
                     }
                     self.frame.locals[udx] = try self.stack.head();
                 },
@@ -261,7 +438,7 @@ pub const VM = struct {
                     try std.Io.File.stdout().writeStreamingAll(self.io, text);
                     try self.stack.push(0);
                 },
-                else => return error.InvalideOpcode,
+                else => return error.InvalidOpcode,
             }
         }
     }
@@ -269,7 +446,7 @@ pub const VM = struct {
 
 pub fn checkBytecodeHeaders(bytes: []const u8) !ByteCode {
     if (bytes.len < 12) {
-        return error.InvalidHeader;
+        return error.TruncatedBytecodeHeader;
     }
 
     const strings_size = std.mem.readInt(i32, bytes[0..4], .little);
@@ -277,7 +454,7 @@ pub fn checkBytecodeHeaders(bytes: []const u8) !ByteCode {
     const public_count = std.mem.readInt(i32, bytes[8..12], .little);
 
     if (strings_size < 0 or globals_count < 0 or public_count < 0) {
-        return error.InvalidHeader;
+        return error.NegativeHeaderField;
     }
 
     const pubs: usize = @intCast(public_count);
@@ -285,12 +462,12 @@ pub fn checkBytecodeHeaders(bytes: []const u8) !ByteCode {
     const remaining = bytes.len - 12;
 
     if (pubs > remaining / 9) {
-        return error.InvalidHeader;
+        return error.TruncatedPublicSymbolTable;
     }
 
     const public_size = pubs * 9;
     if (strs > remaining - public_size) {
-        return error.InvalidHeader;
+        return error.TruncatedStringTable;
     }
 
     const strings_start = 12 + public_size;
@@ -305,25 +482,25 @@ pub fn checkBytecodeHeaders(bytes: []const u8) !ByteCode {
 
         if (symb_type > 1) {
             std.debug.print("Invalid header: symbol_type must be 0 or 1, got {d}\n", .{symb_type});
-            return error.InvalidSymbolType;
+            return error.InvalidPublicSymbolType;
         }
 
         if (string_idx < 0 or string_idx >= strings_size) {
-            return error.InvalidStringOffset;
+            return error.PublicSymbolNameOffsetOutOfBounds;
         }
         if (std.mem.findScalar(u8, strings[@intCast(string_idx)..], 0) == null) {
-            return error.UnterminatedString;
+            return error.UnterminatedPublicSymbolName;
         }
 
         if (global_or_fun_idx < 0) {
-            return error.InvalidSymbolOffset;
+            return error.NegativePublicSymbolOffset;
         }
         if (symb_type == 0) {
             if (@as(usize, @intCast(global_or_fun_idx)) >= code_size) {
-                return error.InvalidSymbolOffset;
+                return error.PublicFunctionAddressOutOfBounds;
             }
         } else if (global_or_fun_idx >= globals_count) {
-            return error.InvalidSymbolOffset;
+            return error.PublicGlobalIndexOutOfBounds;
         }
         std.debug.print("string_idx = {d}, global_or_fun_idx = {d}, symb_type = {d}\n", .{ string_idx, global_or_fun_idx, symb_type });
     }
@@ -336,7 +513,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.len != 2) {
         std.debug.print("Usage: lama_vm <file.bc>\n", .{});
-        return error.InvalidArguments;
+        return error.InvalidCommandLineArguments;
     }
     const filename = args[1];
     const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, filename, init.arena.allocator(), .limited(64 * 1024 * 1024));
@@ -347,6 +524,7 @@ pub fn main(init: std.process.Init) !void {
 
     var vm = VM{
         .code = byteCode.code,
+        .instruction_starts = try markInstructionStarts(init.arena.allocator(), byteCode.code),
         .strings = byteCode.strings,
         .ip = 0,
         .globals = try init.arena.allocator().alloc(Value, byteCode.globals_count),
