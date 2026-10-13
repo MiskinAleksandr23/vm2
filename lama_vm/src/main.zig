@@ -204,7 +204,7 @@ fn markInstructionStarts(alloc: std.mem.Allocator, code: []const u8) ![]bool {
     return error.MissingBytecodeTerminator;
 }
 
-const Vm = struct {
+pub const Vm = struct {
     const Self = @This();
 
     code: []const u8,
@@ -312,14 +312,14 @@ const Vm = struct {
         }
     }
 
-    fn stackPop(self: *Self) !Value {
+    inline fn stackPop(self: *Self) !Value {
         if (self.stack.len <= self.frame.stack_base) {
             return error.StackUnderflow;
         }
         return try self.stack.pop();
     }
 
-    fn stackHead(self: *Self) !Value {
+    inline fn stackHead(self: *Self) !Value {
         if (self.stack.len <= self.frame.stack_base) {
             return error.StackUnderflow;
         }
@@ -350,7 +350,7 @@ const Vm = struct {
         return &values[index];
     }
 
-    pub fn appendValueText(self: *Self, value: Value, buff: *std.ArrayList(u8), path: *std.ArrayList(Value)) anyerror!void {
+    fn appendValueText(self: *Self, value: Value, buff: *std.ArrayList(u8), path: *std.ArrayList(Value)) anyerror!void {
         if ((value & 1) != 0) {
             const number = try unboxIntChecked(value);
             var buffer: [32]u8 = undefined;
@@ -417,7 +417,7 @@ const Vm = struct {
         }
     }
 
-    pub fn referenceChecked(self: *Self, ref: Value) !*Value {
+    fn referenceChecked(self: *Self, ref: Value) !*Value {
         const current = [_][]Value{
             self.globals,
             self.frame.locals,
@@ -446,7 +446,7 @@ const Vm = struct {
         return error.InvalidReference;
     }
 
-    pub fn objectHeaderChecked(self: *Self, value: Value) !*const ObjectHeader {
+    fn objectHeaderChecked(self: *Self, value: Value) !*const ObjectHeader {
         if (value == 0 or (value & 1) != 0 or
             !self.objects.contains(value))
         {
@@ -1267,9 +1267,7 @@ pub fn main(init: std.process.Init) !void {
     const filename = args[1];
     const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, filename, init.arena.allocator(), .limited(64 * 1024 * 1024));
 
-    // std.debug.print("Bytes: {s}\n", .{bytes});
     const byteCode = try checkBytecodeHeaders(bytes);
-    // std.debug.print("byteCode = {any}\n", .{byteCode});
 
     const instruction_starts = try markInstructionStarts(init.arena.allocator(), byteCode.code);
     const public_count: usize = @intCast(std.mem.readInt(i32, bytes[8..12], .little));
