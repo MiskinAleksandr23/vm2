@@ -29,7 +29,7 @@ inline fn unboxIntChecked(value: Value) !isize {
     return @as(isize, @bitCast(value)) >> 1;
 }
 
-fn Stack(comptime T: type, comptime capacity: usize) type {
+pub fn Stack(comptime T: type, comptime capacity: usize) type {
     comptime {
         std.debug.assert(capacity > 0);
     }
@@ -450,6 +450,7 @@ pub const Vm = struct {
         if (value == 0 or (value & 1) != 0 or
             !self.objects.contains(value))
         {
+            @branchHint(.unlikely);
             return error.ExpectedStringOrArray;
         }
         return @ptrFromInt(value - @sizeOf(ObjectHeader));
@@ -571,6 +572,7 @@ pub const Vm = struct {
                         @branchHint(.likely);
                         try self.stack.push(boxInt(@intCast(length)));
                     } else {
+                        @branchHint(.unlikely);
                         return error.ExpectedStringOrArray;
                     }
                 },
@@ -1251,7 +1253,6 @@ pub fn checkBytecodeHeaders(bytes: []const u8) !ByteCode {
         } else if (global_or_fun_idx >= globals_count) {
             return error.PublicGlobalIndexOutOfBounds;
         }
-        std.debug.print("string_idx = {d}, global_or_fun_idx = {d}, symb_type = {d}\n", .{ string_idx, global_or_fun_idx, symb_type });
     }
     const code_start = 12 + pubs * 9 + strs;
     return ByteCode{ .code = bytes[code_start..], .globals_count = @intCast(globals_count), .strings = strings };
