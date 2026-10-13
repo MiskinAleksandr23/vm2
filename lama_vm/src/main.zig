@@ -10,7 +10,7 @@ comptime {
 extern fn LtagHash(name: [*:0]const u8) i64;
 extern fn de_hash(tag: i64) [*:0]const u8;
 
-const kStackSize = 1 << 15;
+const stack_size = 1 << 15;
 const Value = usize;
 
 inline fn boxInt(n: isize) Value {
@@ -29,10 +29,13 @@ inline fn unboxIntChecked(value: Value) !isize {
     return @as(isize, @bitCast(value)) >> 1;
 }
 
-fn Stack(comptime T: type) type {
+fn Stack(comptime T: type, comptime capacity: usize) type {
+    comptime {
+        std.debug.assert(capacity > 0);
+    }
     return struct {
         const Self = @This();
-        data: [kStackSize]T = undefined,
+        data: [capacity]T = undefined,
         len: usize = 0,
 
         pub fn init() Self {
@@ -51,7 +54,7 @@ fn Stack(comptime T: type) type {
         }
 
         pub fn push(self: *Self, element: T) !void {
-            if (self.len >= kStackSize) {
+            if (self.len >= capacity) {
                 @branchHint(.unlikely);
                 return error.StackOverflow;
             }
@@ -93,6 +96,79 @@ const ObjectHeader = extern struct {
     forward_address: usize,
 };
 
+const Op = enum(u8) {
+    Add = 0x01,
+    Sub = 0x02,
+    Mul = 0x03,
+    Div = 0x04,
+    Rem = 0x05,
+    Less = 0x06,
+    LessEqual = 0x07,
+    Greater = 0x08,
+    GreaterEqual = 0x09,
+    Equal = 0x0A,
+    NotEqual = 0x0B,
+    And = 0x0C,
+    Or = 0x0D,
+
+    Const = 0x10,
+    String = 0x11,
+    Sexp = 0x12,
+    StoreIndirect = 0x13,
+    StoreElement = 0x14,
+    Jump = 0x15,
+    End = 0x16,
+    Ret = 0x17,
+    Drop = 0x18,
+    Dup = 0x19,
+    Swap = 0x1A,
+    Elem = 0x1B,
+
+    LoadGlobal = 0x20,
+    LoadLocal = 0x21,
+    LoadArg = 0x22,
+    LoadClosure = 0x23,
+
+    LoadAddressGlobal = 0x30,
+    LoadAddressLocal = 0x31,
+    LoadAddressArg = 0x32,
+    LoadAddressClosure = 0x33,
+
+    StoreGlobal = 0x40,
+    StoreLocal = 0x41,
+    StoreArg = 0x42,
+    StoreClosure = 0x43,
+
+    JumpZero = 0x50,
+    JumpNonZero = 0x51,
+    Begin = 0x52,
+    CBegin = 0x53,
+    Closure = 0x54,
+    CallClosure = 0x55,
+    Call = 0x56,
+    Tag = 0x57,
+    ArrayPattern = 0x58,
+    Fail = 0x59,
+    Line = 0x5A,
+
+    StringEqual = 0x60,
+    IsString = 0x61,
+    IsArray = 0x62,
+    IsSexp = 0x63,
+    IsBoxed = 0x64,
+    IsUnboxed = 0x65,
+    IsClosure = 0x66,
+
+    Read = 0x70,
+    Write = 0x71,
+    Length = 0x72,
+    ToString = 0x73,
+    Array = 0x74,
+
+    Terminator = 0xFF,
+    _,
+};
+
 fn markInstructionStarts(alloc: std.mem.Allocator, code: []const u8) ![]bool {
     const starts = try alloc.alloc(bool, code.len);
     errdefer alloc.free(starts);
@@ -108,9 +184,9 @@ fn markInstructionStarts(alloc: std.mem.Allocator, code: []const u8) ![]bool {
         }
 
         const size: usize = switch (code[offset]) {
-            0x01...0x03, 0x06...0x0B, 0x16, 0x17, 0x18...0x1A, 0x71, 0x04, 0x05, 0x0C, 0x0D, 0x70, 0x72, 0x1B, 0x14, 0x13, 0x73, 0x64, 0x65, 0x60, 0x61, 0x62, 0x63, 0x66 => 1,
-            0x10, 0x15, 0x20, 0x21, 0x22, 0x40, 0x41, 0x42, 0x50, 0x51, 0x5A, 0x11, 0x74, 0x30, 0x31, 0x32, 0x58, 0x23, 0x33, 0x43, 0x55 => 5,
-            0x52, 0x53, 0x56, 0x12, 0x57, 0x59 => 9,
+            0x01...0x0D, 0x13...0x14, 0x16...0x1B, 0x60...0x66, 0x70...0x73 => 1,
+            0x10...0x11, 0x15, 0x20...0x23, 0x30...0x33, 0x40...0x43, 0x50...0x51, 0x55, 0x58, 0x5A, 0x74 => 5,
+            0x12, 0x52...0x53, 0x56...0x57, 0x59 => 9,
             0x54 => blk: {
                 if (code.len - offset < 9) return error.TruncatedInstruction;
                 const count = std.mem.readInt(i32, code[offset + 5 ..][0..4], .little);
@@ -128,18 +204,19 @@ fn markInstructionStarts(alloc: std.mem.Allocator, code: []const u8) ![]bool {
     return error.MissingBytecodeTerminator;
 }
 
-pub const VM = struct {
+const Vm = struct {
     const Self = @This();
+
     code: []const u8,
     instruction_starts: []const bool,
     strings: []const u8,
     ip: usize,
 
     globals: []Value,
-    stack: Stack(Value),
+    stack: Stack(Value, stack_size),
 
     frame: Frame,
-    call_stack: Stack(SavedFrame),
+    call_stack: Stack(SavedFrame, stack_size),
 
     current_line: ?i32,
 
@@ -149,7 +226,7 @@ pub const VM = struct {
     input_pos: usize = 0,
     objects: std.AutoHashMapUnmanaged(Value, void) = .empty,
 
-    pub fn createString(self: *Self, bytes: []const u8) !Value {
+    fn createString(self: *Self, bytes: []const u8) !Value {
         const size = @sizeOf(ObjectHeader) + bytes.len + 1;
         const buff = try self.alloc.alignedAlloc(u8, std.mem.Alignment.of(ObjectHeader), size);
 
@@ -165,7 +242,7 @@ pub const VM = struct {
         return value;
     }
 
-    pub fn readInputInteger(self: *Self) !isize {
+    fn readInputInteger(self: *Self) !isize {
         if (self.input_data == null) {
             var reader = std.Io.File.stdin().readerStreaming(self.io, &.{});
             self.input_data = reader.interface.allocRemaining(self.alloc, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
@@ -202,7 +279,7 @@ pub const VM = struct {
         };
     }
 
-    pub inline fn ensureEnoughBytes(self: *Self, need: usize) !void {
+    inline fn ensureEnoughBytes(self: *Self, need: usize) !void {
         if (need > self.code.len - self.ip) {
             @branchHint(.unlikely);
             std.debug.print(
@@ -212,20 +289,20 @@ pub const VM = struct {
             return error.UnexpectedEndOfBytecode;
         }
     }
-    pub fn readByte(self: *Self) !u8 {
+    fn readByte(self: *Self) !u8 {
         try self.ensureEnoughBytes(1);
         const byte = self.code[self.ip];
         self.ip += 1;
         return byte;
     }
-    pub fn readI32(self: *Self) !i32 {
+    fn readI32(self: *Self) !i32 {
         try self.ensureEnoughBytes(4);
         const value = std.mem.readInt(i32, self.code[self.ip..][0..4], .little);
         self.ip += 4;
         return value;
     }
 
-    pub inline fn CheckAddress(self: *Self, addr: usize) !void {
+    inline fn CheckAddress(self: *Self, addr: usize) !void {
         if (addr >= self.code.len) {
             @branchHint(.unlikely);
             return error.JumpAddressOutOfBounds;
@@ -235,18 +312,27 @@ pub const VM = struct {
         }
     }
 
-    pub fn stackPop(self: *Self) !Value {
+    fn stackPop(self: *Self) !Value {
         if (self.stack.len <= self.frame.stack_base) {
             return error.StackUnderflow;
         }
         return try self.stack.pop();
     }
 
-    pub fn stackHead(self: *Self) !Value {
+    fn stackHead(self: *Self) !Value {
         if (self.stack.len <= self.frame.stack_base) {
             return error.StackUnderflow;
         }
         return try self.stack.head();
+    }
+
+    inline fn readNonNegativeI32(self: *Self, comptime negative_error: anyerror) !usize {
+        const value = try self.readI32();
+        if (value < 0) {
+            @branchHint(.unlikely);
+            return negative_error;
+        }
+        return @intCast(value);
     }
 
     fn referenceInSlice(ref: Value, values: []Value) ?*Value {
@@ -370,28 +456,26 @@ pub const VM = struct {
     }
 
     pub fn run(self: *Self) !void {
-        // TODO: next() in cycle
         while (true) {
-            const opcode = try self.readByte();
+            const opcode: Op = @enumFromInt(try self.readByte());
             switch (opcode) {
-                // TODO: optimize some operations inplace
-                0x01 => {
+                Op.Add => {
                     const right = try unboxIntChecked(try self.stackPop());
                     const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(left +% right));
                 },
-                0x02 => {
+                Op.Sub => {
                     const right = try unboxIntChecked(try self.stackPop());
                     const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(left -% right));
                 },
-                0x03 => {
+                Op.Mul => {
                     const right = try unboxIntChecked(try self.stackPop());
                     const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(left *% right));
                 },
 
-                0x04 => {
+                Op.Div => {
                     const right = try unboxIntChecked(try self.stackPop());
                     const left = try unboxIntChecked(try self.stackPop());
                     if (right == 0) {
@@ -399,7 +483,7 @@ pub const VM = struct {
                     }
                     try self.stack.push(boxInt(@divTrunc(left, right)));
                 },
-                0x05 => {
+                Op.Rem => {
                     const right = try unboxIntChecked(try self.stackPop());
                     const left = try unboxIntChecked(try self.stackPop());
                     if (right == 0) {
@@ -407,91 +491,77 @@ pub const VM = struct {
                     }
                     try self.stack.push(boxInt(@rem(left, right)));
                 },
-                0x06 => {
+                Op.Less => {
                     const right = try unboxIntChecked(try self.stackPop());
                     const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(@intFromBool(left < right)));
                 },
-                0x07 => {
+                Op.LessEqual => {
                     const right = try unboxIntChecked(try self.stackPop());
                     const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(@intFromBool(left <= right)));
                 },
-                0x08 => {
+                Op.Greater => {
                     const right = try unboxIntChecked(try self.stackPop());
                     const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(@intFromBool(left > right)));
                 },
-                0x09 => {
+                Op.GreaterEqual => {
                     const right = try unboxIntChecked(try self.stackPop());
                     const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(@intFromBool(left >= right)));
                 },
-                0x12 => {
-                    const offset = try self.readI32();
-                    const count = try self.readI32();
-
-                    if (offset < 0) {
+                Op.Sexp => {
+                    const offset = try self.readNonNegativeI32(error.NegativeStringOffset);
+                    if (offset >= self.strings.len) {
                         @branchHint(.unlikely);
-                        return error.NegativeStringOffset;
-                    }
-                    const uoffset: usize = @intCast(offset);
-                    if (uoffset >= self.strings.len) {
                         return error.StringOffsetOutOfBounds;
                     }
-                    const tail = self.strings[uoffset..];
-                    const end = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
-                    const constructor_name = tail[0..end];
 
-                    if (count < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeSexpFieldCount;
-                    }
-                    const ucount: usize = @intCast(count);
+                    const count = try self.readNonNegativeI32(error.NegativeSexpFieldCount);
                     if (self.stack.len < self.frame.stack_base or
-                        ucount > self.stack.len - self.frame.stack_base)
+                        count > self.stack.len - self.frame.stack_base)
                     {
                         @branchHint(.unlikely);
                         return error.StackUnderflow;
                     }
+
+                    const tail = self.strings[offset..];
+                    const end = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
+                    const constructor_name = tail[0..end];
                     const name = try self.alloc.dupeZ(u8, constructor_name);
                     const encoded: Value = @intCast(LtagHash(name.ptr));
                     const tag = try unboxIntChecked(encoded);
 
-                    const buff = try self.alloc.alignedAlloc(u8, std.mem.Alignment.of(ObjectHeader), 24 + ucount * 8);
+                    const buff = try self.alloc.alignedAlloc(u8, std.mem.Alignment.of(ObjectHeader), 24 + count * 8);
 
                     const header: *ObjectHeader = @ptrCast(buff.ptr);
-                    header.data_header = (ucount << 3) | 5;
+                    header.data_header = (count << 3) | 5;
                     header.forward_address = 0;
 
                     const constructor_tag: *usize = @ptrCast(@alignCast(buff.ptr + 16));
                     constructor_tag.* = @intCast(tag);
                     const elements: [*]Value = @ptrCast(@alignCast(buff.ptr + 24));
-                    for (0..ucount) |i| {
-                        elements[ucount - 1 - i] = try self.stackPop();
+                    for (0..count) |i| {
+                        elements[count - 1 - i] = try self.stackPop();
                     }
                     const object = @intFromPtr(buff.ptr + @sizeOf(ObjectHeader));
                     try self.objects.put(self.alloc, object, {});
                     try self.stack.push(object);
                 },
-                0x11 => {
-                    const offset = try self.readI32();
-                    if (offset < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeStringOffset;
-                    }
-                    const udx: usize = @intCast(offset);
-                    if (udx >= self.strings.len) {
+                Op.String => {
+                    const offset = try self.readNonNegativeI32(error.NegativeStringOffset);
+                    if (offset >= self.strings.len) {
                         @branchHint(.unlikely);
                         return error.StringOffsetOutOfBounds;
                     }
-                    const tail = self.strings[udx..];
+                    const tail = self.strings[offset..];
                     const end = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
                     const bytes = tail[0..end];
                     const value = try self.createString(bytes);
                     try self.stack.push(value);
                 },
-                0x72 => {
+                Op.Length => {
                     const value = try self.stackPop();
                     const header = try self.objectHeaderChecked(value);
                     const tag = header.data_header & 7;
@@ -504,41 +574,31 @@ pub const VM = struct {
                         return error.ExpectedStringOrArray;
                     }
                 },
-                0x74 => {
-                    const elem_cnt = try self.readI32();
-                    if (elem_cnt < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeArrayLength;
-                    }
-                    const ucnt: usize = @intCast(elem_cnt);
+                Op.Array => {
+                    const elem_cnt = try self.readNonNegativeI32(error.NegativeArrayLength);
                     if (self.stack.len < self.frame.stack_base or
-                        ucnt > self.stack.len - self.frame.stack_base)
+                        elem_cnt > self.stack.len - self.frame.stack_base)
                     {
                         @branchHint(.unlikely);
                         return error.StackUnderflow;
                     }
-                    const len = @sizeOf(ObjectHeader) + @sizeOf(Value) * ucnt;
+                    const len = @sizeOf(ObjectHeader) + @sizeOf(Value) * elem_cnt;
                     const buff = try self.alloc.alignedAlloc(u8, std.mem.Alignment.of(ObjectHeader), len);
 
                     const header: *ObjectHeader = @ptrCast(buff.ptr);
-                    header.data_header = (ucnt << 3) | 3;
+                    header.data_header = (elem_cnt << 3) | 3;
                     header.forward_address = 0;
 
-                    for (0..ucnt) |i| {
+                    for (0..elem_cnt) |i| {
                         const value: [*]Value = @ptrCast(@alignCast(buff.ptr + @sizeOf(ObjectHeader)));
-                        value[ucnt - 1 - i] = try self.stackPop();
+                        value[elem_cnt - 1 - i] = try self.stackPop();
                     }
                     const object = @intFromPtr(buff.ptr) + @sizeOf(ObjectHeader);
                     try self.objects.put(self.alloc, object, {});
                     try self.stack.push(object);
                 },
-                0x58 => {
-                    const args_cnt = try self.readI32();
-                    if (args_cnt < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeArrayLength;
-                    }
-                    const uargs_cnt: usize = @intCast(args_cnt);
+                Op.ArrayPattern => {
+                    const args_cnt = try self.readNonNegativeI32(error.NegativeArrayLength);
                     const value = try self.stackPop();
 
                     var matches = false;
@@ -546,13 +606,13 @@ pub const VM = struct {
                     if (self.objects.contains(value)) {
                         const header = try self.objectHeaderChecked(value);
                         matches = ((header.data_header & 7) == 3) and
-                            ((header.data_header >> 3) == uargs_cnt);
+                            ((header.data_header >> 3) == args_cnt);
                     }
 
                     try self.stack.push(boxInt(@intFromBool(matches)));
                 },
 
-                0x1B => {
+                Op.Elem => {
                     const index = try unboxIntChecked(try self.stackPop());
                     if (index < 0) {
                         @branchHint(.unlikely);
@@ -586,7 +646,7 @@ pub const VM = struct {
                         try self.stack.push(elements[uindex]);
                     }
                 },
-                0x14 => {
+                Op.StoreElement => {
                     const new_value = try self.stackPop();
                     const index_or_ref = try self.stackPop();
                     if ((index_or_ref & 1) == 0) {
@@ -634,43 +694,28 @@ pub const VM = struct {
                         try self.stack.push(new_value);
                     }
                 },
-                0x30 => {
-                    const idx = try self.readI32();
-                    if (idx < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeGlobalIndex;
-                    }
-                    const uidx: usize = @intCast(idx);
-                    if (uidx >= self.globals.len) {
+                Op.LoadAddressGlobal => {
+                    const idx = try self.readNonNegativeI32(error.NegativeGlobalIndex);
+                    if (idx >= self.globals.len) {
                         return error.GlobalIndexOutOfBounds;
                     }
-                    try self.stack.push(@intFromPtr(&self.globals[uidx]));
+                    try self.stack.push(@intFromPtr(&self.globals[idx]));
                 },
-                0x31 => {
-                    const idx = try self.readI32();
-                    if (idx < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeLocalIndex;
-                    }
-                    const uidx: usize = @intCast(idx);
-                    if (uidx >= self.frame.locals.len) {
+                Op.LoadAddressLocal => {
+                    const idx = try self.readNonNegativeI32(error.NegativeLocalIndex);
+                    if (idx >= self.frame.locals.len) {
                         return error.LocalIndexOutOfBounds;
                     }
-                    try self.stack.push(@intFromPtr(&self.frame.locals[uidx]));
+                    try self.stack.push(@intFromPtr(&self.frame.locals[idx]));
                 },
-                0x32 => {
-                    const idx = try self.readI32();
-                    if (idx < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeArgumentIndex;
-                    }
-                    const uidx: usize = @intCast(idx);
-                    if (uidx >= self.frame.args.len) {
+                Op.LoadAddressArg => {
+                    const idx = try self.readNonNegativeI32(error.NegativeArgumentIndex);
+                    if (idx >= self.frame.args.len) {
                         return error.ArgumentIndexOutOfBounds;
                     }
-                    try self.stack.push(@intFromPtr(&self.frame.args[uidx]));
+                    try self.stack.push(@intFromPtr(&self.frame.args[idx]));
                 },
-                0x13 => {
+                Op.StoreIndirect => {
                     const new_value = try self.stackPop();
                     const ref = try self.stackPop();
 
@@ -679,7 +724,7 @@ pub const VM = struct {
 
                     try self.stack.push(new_value);
                 },
-                0x0A => {
+                Op.Equal => {
                     const right = try self.stackPop();
                     const left = try self.stackPop();
                     if ((left & 1) == 1 and (right & 1) == 1) {
@@ -690,219 +735,146 @@ pub const VM = struct {
                         return error.ExpectedInteger;
                     }
                 },
-                0x0B => {
+                Op.NotEqual => {
                     const right = try unboxIntChecked(try self.stackPop());
                     const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(@intFromBool(left != right)));
                 },
-                0x0C => {
+                Op.And => {
                     const right = try unboxIntChecked(try self.stackPop());
                     const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(@intFromBool((left != 0) and (right != 0))));
                 },
-                0x0D => {
+                Op.Or => {
                     const right = try unboxIntChecked(try self.stackPop());
                     const left = try unboxIntChecked(try self.stackPop());
                     try self.stack.push(boxInt(@intFromBool((left != 0) or (right != 0))));
                 },
-                0x15 => {
-                    const addr = try self.readI32();
-                    if (addr < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeJumpAddress;
-                    }
-                    const uaddr: usize = @intCast(addr);
-                    try self.CheckAddress(uaddr);
-                    self.ip = uaddr;
+                Op.Jump => {
+                    const addr = try self.readNonNegativeI32(error.NegativeJumpAddress);
+                    try self.CheckAddress(addr);
+                    self.ip = addr;
                 },
-                0x22 => {
-                    const idx = try self.readI32();
-                    if (idx < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeArgumentIndex;
-                    }
-                    const udx: usize = @intCast(idx);
-                    if (udx >= self.frame.args.len) {
+                Op.LoadArg => {
+                    const idx = try self.readNonNegativeI32(error.NegativeArgumentIndex);
+                    if (idx >= self.frame.args.len) {
                         @branchHint(.unlikely);
                         return error.ArgumentIndexOutOfBounds;
                     }
-                    try self.stack.push(self.frame.args[udx]);
+                    try self.stack.push(self.frame.args[idx]);
                 },
-                0x42 => {
-                    const idx = try self.readI32();
-                    if (idx < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeArgumentIndex;
-                    }
-                    const udx: usize = @intCast(idx);
-                    if (udx >= self.frame.args.len) {
+                Op.StoreArg => {
+                    const idx = try self.readNonNegativeI32(error.NegativeArgumentIndex);
+                    if (idx >= self.frame.args.len) {
                         @branchHint(.unlikely);
                         return error.ArgumentIndexOutOfBounds;
                     }
-                    self.frame.args[udx] = try self.stackHead();
+                    self.frame.args[idx] = try self.stackHead();
                 },
-                0x50 => {
-                    const addr = try self.readI32();
-                    if (addr < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeJumpAddress;
-                    }
-                    const uaddr: usize = @intCast(addr);
-                    try self.CheckAddress(uaddr);
+                Op.JumpZero => {
+                    const addr = try self.readNonNegativeI32(error.NegativeJumpAddress);
+                    try self.CheckAddress(addr);
                     if (0 == try unboxIntChecked(try self.stackPop())) {
-                        self.ip = uaddr;
+                        self.ip = addr;
                     }
                 },
-                0x51 => {
-                    const addr = try self.readI32();
-                    if (addr < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeJumpAddress;
-                    }
-                    const uaddr: usize = @intCast(addr);
-                    try self.CheckAddress(uaddr);
+                Op.JumpNonZero => {
+                    const addr = try self.readNonNegativeI32(error.NegativeJumpAddress);
+                    try self.CheckAddress(addr);
                     if (0 != try unboxIntChecked(try self.stackPop())) {
-                        self.ip = uaddr;
+                        self.ip = addr;
                     }
                 },
-                0x23 => {
-                    const idx = try self.readI32();
-                    if (idx < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeClosureIndex;
-                    }
-                    const uidx: usize = @intCast(idx);
-                    if (uidx >= self.frame.closure.len) {
+                Op.LoadClosure => {
+                    const idx = try self.readNonNegativeI32(error.NegativeClosureIndex);
+                    if (idx >= self.frame.closure.len) {
                         return error.ClosureIndexOutOfBounds;
                     }
-                    try self.stack.push(self.frame.closure[uidx]);
+                    try self.stack.push(self.frame.closure[idx]);
                 },
-                0x33 => {
-                    const idx = try self.readI32();
-                    if (idx < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeClosureIndex;
-                    }
-                    const uidx: usize = @intCast(idx);
-                    if (uidx >= self.frame.closure.len) {
+                Op.LoadAddressClosure => {
+                    const idx = try self.readNonNegativeI32(error.NegativeClosureIndex);
+                    if (idx >= self.frame.closure.len) {
                         return error.ClosureIndexOutOfBounds;
                     }
-                    try self.stack.push(@intFromPtr(&self.frame.closure[uidx]));
+                    try self.stack.push(@intFromPtr(&self.frame.closure[idx]));
                 },
-                0x43 => {
-                    const idx = try self.readI32();
-                    if (idx < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeClosureIndex;
-                    }
-                    const uidx: usize = @intCast(idx);
-                    if (uidx >= self.frame.closure.len) {
+                Op.StoreClosure => {
+                    const idx = try self.readNonNegativeI32(error.NegativeClosureIndex);
+                    if (idx >= self.frame.closure.len) {
                         return error.ClosureIndexOutOfBounds;
                     }
-                    self.frame.closure[uidx] = try self.stackHead();
+                    self.frame.closure[idx] = try self.stackHead();
                 },
-                0x52, 0x53 => {
-                    const args_count = try self.readI32();
-                    const locals_count = try self.readI32();
-
-                    if (args_count < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeArgumentCount;
-                    }
-                    if (locals_count < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeLocalCount;
-                    }
-
-                    const uargs_count: usize = @intCast(args_count);
-                    const ulocals_count: usize = @intCast(locals_count);
+                Op.Begin, Op.CBegin => {
+                    const args_count = try self.readNonNegativeI32(error.NegativeArgumentCount);
+                    const locals_count = try self.readNonNegativeI32(error.NegativeLocalCount);
 
                     if (self.call_stack.len == 0) {
-                        self.frame.args = try self.alloc.alloc(Value, uargs_count);
+                        self.frame.args = try self.alloc.alloc(Value, args_count);
                         @memset(self.frame.args, 0);
                     } else {
-                        if (uargs_count != self.frame.args.len) {
+                        if (args_count != self.frame.args.len) {
+                            @branchHint(.unlikely);
                             return error.ArgumentCountMismatch;
                         }
                     }
 
-                    self.frame.locals = try self.alloc.alloc(Value, ulocals_count);
+                    self.frame.locals = try self.alloc.alloc(Value, locals_count);
                     @memset(self.frame.locals, 0);
-
-                    // std.debug.print("BEGIN args={d} locals={d}\n", .{
-                    //     args_count, locals_count,
-                    // });
                 },
-                0x54 => {
-                    const addr = try self.readI32();
-                    const count = try self.readI32();
+                Op.Closure => {
+                    const addr = try self.readNonNegativeI32(error.NegativeClosureAddress);
+                    const count = try self.readNonNegativeI32(error.NegativeClosureCaptureCount);
 
-                    if (addr < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeClosureAddress;
-                    }
-                    if (count < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeClosureCaptureCount;
-                    }
-                    const uaddr: usize = @intCast(addr);
-                    const ucount: usize = @intCast(count);
-
-                    try self.CheckAddress(uaddr);
-                    if (self.code[uaddr] != 0x52 and self.code[uaddr] != 0x53) {
+                    try self.CheckAddress(addr);
+                    if (self.code[addr] != 0x52 and self.code[addr] != 0x53) {
                         return error.ClosureTargetNotFunction;
                     }
 
                     const buff = try self.alloc.alignedAlloc(
                         u8,
                         std.mem.Alignment.of(ObjectHeader),
-                        24 + ucount * @sizeOf(Value),
+                        24 + count * @sizeOf(Value),
                     );
 
                     const header: *ObjectHeader = @ptrCast(buff.ptr);
-                    header.data_header = ((ucount + 1) << 3) | 7;
+                    header.data_header = ((count + 1) << 3) | 7;
                     header.forward_address = 0;
 
                     const function_addr: *usize = @ptrCast(@alignCast(buff.ptr + 16));
-                    function_addr.* = uaddr;
+                    function_addr.* = addr;
 
                     const captures: [*]Value = @ptrCast(@alignCast(buff.ptr + 24));
 
-                    for (0..ucount) |idx| {
-                        const d = try self.readByte();
-                        const id = try self.readI32();
-                        if (id < 0) {
-                            @branchHint(.unlikely);
-                            return error.NegativeClosureCaptureIndex;
-                        }
+                    for (0..count) |idx| {
+                        const d: usize = @intCast(try self.readByte());
+                        const id = try self.readNonNegativeI32(error.NegativeClosureCaptureIndex);
 
-                        const ud: usize = @intCast(d);
-                        const uid: usize = @intCast(id);
-
-                        if (ud == 0) {
-                            if (uid >= self.globals.len) {
+                        if (d == 0) {
+                            if (id >= self.globals.len) {
                                 @branchHint(.unlikely);
                                 return error.GlobalIndexOutOfBounds;
                             }
-                            captures[idx] = self.globals[uid];
-                        } else if (ud == 1) {
-                            if (uid >= self.frame.locals.len) {
+                            captures[idx] = self.globals[id];
+                        } else if (d == 1) {
+                            if (id >= self.frame.locals.len) {
                                 @branchHint(.unlikely);
                                 return error.LocalIndexOutOfBounds;
                             }
-                            captures[idx] = self.frame.locals[uid];
-                        } else if (ud == 2) {
-                            if (uid >= self.frame.args.len) {
+                            captures[idx] = self.frame.locals[id];
+                        } else if (d == 2) {
+                            if (id >= self.frame.args.len) {
                                 @branchHint(.unlikely);
                                 return error.ArgumentIndexOutOfBounds;
                             }
-                            captures[idx] = self.frame.args[uid];
-                        } else if (ud == 3) {
-                            if (uid >= self.frame.closure.len) {
+                            captures[idx] = self.frame.args[id];
+                        } else if (d == 3) {
+                            if (id >= self.frame.closure.len) {
                                 @branchHint(.unlikely);
                                 return error.ClosureIndexOutOfBounds;
                             }
-                            captures[idx] = self.frame.closure[uid];
+                            captures[idx] = self.frame.closure[id];
                         } else {
                             return error.InvalidClosureCaptureScope;
                         }
@@ -911,19 +883,14 @@ pub const VM = struct {
                     try self.objects.put(self.alloc, object, {});
                     try self.stack.push(object);
                 },
-                0x5A => {
+                Op.Line => {
                     const line = try self.readI32();
                     self.current_line = line;
                 },
-                0x55 => {
-                    const count = try self.readI32();
-                    if (count < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeArgumentCount;
-                    }
-                    const ucount: usize = @intCast(count);
+                Op.CallClosure => {
+                    const count = try self.readNonNegativeI32(error.NegativeArgumentCount);
                     if (self.stack.len < self.frame.stack_base or
-                        ucount + 1 > self.stack.len - self.frame.stack_base)
+                        count + 1 > self.stack.len - self.frame.stack_base)
                     {
                         return error.StackUnderflow;
                     }
@@ -932,9 +899,9 @@ pub const VM = struct {
                     }
 
                     var new_frame: Frame = undefined;
-                    const args = try self.alloc.alloc(Value, ucount);
-                    for (0..ucount) |i| {
-                        args[ucount - 1 - i] = try self.stackPop();
+                    const args = try self.alloc.alloc(Value, count);
+                    for (0..count) |i| {
+                        args[count - 1 - i] = try self.stackPop();
                     }
 
                     const object = try self.stackPop();
@@ -968,31 +935,20 @@ pub const VM = struct {
                     self.ip = uaddr;
                 },
 
-                0x56 => {
-                    const addr = try self.readI32();
-                    const args_cnt = try self.readI32();
+                Op.Call => {
+                    const addr = try self.readNonNegativeI32(error.NegativeJumpAddress);
+                    try self.CheckAddress(addr);
 
-                    if (addr < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeJumpAddress;
-                    }
-                    const uaddr: usize = @intCast(addr);
-                    try self.CheckAddress(uaddr);
-
-                    if (args_cnt < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeArgumentCount;
-                    }
-                    const uargs_cnt: usize = @intCast(args_cnt);
-                    if (self.code[uaddr] != 0x52) {
+                    const args_cnt = try self.readNonNegativeI32(error.NegativeArgumentCount);
+                    if (self.code[addr] != 0x52) {
                         return error.CallTargetNotFunction;
                     }
-                    if (self.code.len - uaddr < 9) {
+                    if (self.code.len - addr < 9) {
                         return error.TruncatedInstruction;
                     }
                     const declared_args = std.mem.readInt(
                         i32,
-                        self.code[uaddr + 1 ..][0..4],
+                        self.code[addr + 1 ..][0..4],
                         .little,
                     );
                     if (declared_args < 0) {
@@ -1002,7 +958,7 @@ pub const VM = struct {
                         return error.ArgumentCountMismatch;
                     }
                     if (self.stack.len < self.frame.stack_base or
-                        uargs_cnt > self.stack.len - self.frame.stack_base)
+                        args_cnt > self.stack.len - self.frame.stack_base)
                     {
                         return error.StackUnderflow;
                     }
@@ -1011,9 +967,9 @@ pub const VM = struct {
                     }
 
                     var new_frame: Frame = undefined;
-                    new_frame.args = try self.alloc.alloc(Value, uargs_cnt);
-                    for (0..uargs_cnt) |idx| {
-                        new_frame.args[uargs_cnt - 1 - idx] = try self.stackPop();
+                    new_frame.args = try self.alloc.alloc(Value, args_cnt);
+                    for (0..args_cnt) |idx| {
+                        new_frame.args[args_cnt - 1 - idx] = try self.stackPop();
                     }
                     const saved = SavedFrame{ .frame = self.frame, .return_ip = self.ip };
                     try self.call_stack.push(saved);
@@ -1023,28 +979,17 @@ pub const VM = struct {
                     new_frame.stack_base = self.stack.len;
 
                     self.frame = new_frame;
-                    self.ip = uaddr;
+                    self.ip = addr;
                 },
-                0x57 => {
-                    const offset = try self.readI32();
-                    const count = try self.readI32();
+                Op.Tag => {
+                    const offset = try self.readNonNegativeI32(error.NegativeStringOffset);
+                    const count = try self.readNonNegativeI32(error.NegativeSexpFieldCount);
 
-                    if (offset < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeStringOffset;
-                    }
-                    if (count < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeSexpFieldCount;
-                    }
-                    const uoffset: usize = @intCast(offset);
-                    const ucount: usize = @intCast(count);
-
-                    if (uoffset >= self.strings.len) {
+                    if (offset >= self.strings.len) {
                         return error.StringOffsetOutOfBounds;
                     }
 
-                    const tail = self.strings[uoffset..];
+                    const tail = self.strings[offset..];
                     const end = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
 
                     const constructor_name = tail[0..end];
@@ -1060,13 +1005,13 @@ pub const VM = struct {
                             const constructor_tag: *const usize = @ptrFromInt(value);
                             const expected_tag: usize = @intCast(tag);
 
-                            matches = ((header.data_header >> 3) == ucount) and
+                            matches = ((header.data_header >> 3) == count) and
                                 (constructor_tag.* == expected_tag);
                         }
                     }
                     try self.stack.push(boxInt(@intFromBool(matches)));
                 },
-                0x60 => {
+                Op.StringEqual => {
                     const right = try self.stackPop();
                     const left = try self.stackPop();
 
@@ -1091,7 +1036,7 @@ pub const VM = struct {
                     }
                     try self.stack.push(boxInt(@intFromBool(matches)));
                 },
-                0x61 => {
+                Op.IsString => {
                     const value = try self.stackPop();
                     var matches = false;
 
@@ -1101,7 +1046,7 @@ pub const VM = struct {
                     }
                     try self.stack.push(boxInt(@intFromBool(matches)));
                 },
-                0x62 => {
+                Op.IsArray => {
                     const value = try self.stackPop();
                     var matches = false;
 
@@ -1111,7 +1056,7 @@ pub const VM = struct {
                     }
                     try self.stack.push(boxInt(@intFromBool(matches)));
                 },
-                0x63 => {
+                Op.IsSexp => {
                     const value = try self.stackPop();
                     var matches = false;
 
@@ -1121,7 +1066,7 @@ pub const VM = struct {
                     }
                     try self.stack.push(boxInt(@intFromBool(matches)));
                 },
-                0x66 => {
+                Op.IsClosure => {
                     const value = try self.stackPop();
                     var matches = false;
 
@@ -1131,31 +1076,27 @@ pub const VM = struct {
                     }
                     try self.stack.push(boxInt(@intFromBool(matches)));
                 },
-                0x64 => {
+                Op.IsBoxed => {
                     const value = try self.stackPop();
                     try self.stack.push(boxInt(@intFromBool((value & 1) == 0)));
                 },
-                0x65 => {
+                Op.IsUnboxed => {
                     const value = try self.stackPop();
                     try self.stack.push(boxInt(@intFromBool((value & 1) != 0)));
                 },
-                0x59 => {
-                    const row = try self.readI32();
-                    const column = try self.readI32();
+                Op.Fail => {
+                    const row = try self.readNonNegativeI32(error.InvalidSourceLocation);
+                    const column = try self.readNonNegativeI32(error.InvalidSourceLocation);
 
-                    if (row < 0 or column < 0) {
-                        @branchHint(.unlikely);
-                        return error.InvalidSourceLocation;
-                    }
                     _ = try self.stackHead();
                     std.debug.print("Pattern matching failed: row = {d}, column = {d}\n", .{ row, column });
                     return error.MatchFailure;
                 },
-                0x10 => {
+                Op.Const => {
                     const element = try self.readI32();
                     try self.stack.push(boxInt(element));
                 },
-                0x16, 0x17 => {
+                Op.End, Op.Ret => {
                     if (self.call_stack.len == 0) {
                         return;
                     }
@@ -1171,77 +1112,57 @@ pub const VM = struct {
                         try self.stack.push(v);
                     }
                 },
-                0x18 => {
+                Op.Drop => {
                     _ = try self.stackPop();
                 },
 
-                0x19 => {
+                Op.Dup => {
                     const value = try self.stackHead();
                     try self.stack.push(value);
                 },
-                0x1A => {
+                Op.Swap => {
                     const right = try self.stackPop();
                     const left = try self.stackPop();
 
                     try self.stack.push(right);
                     try self.stack.push(left);
                 },
-                0x20 => {
-                    const idx = try self.readI32();
-                    if (idx < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeGlobalIndex;
-                    }
-                    const udx: usize = @intCast(idx);
-                    if (udx >= self.globals.len) {
+                Op.LoadGlobal => {
+                    const idx = try self.readNonNegativeI32(error.NegativeGlobalIndex);
+                    if (idx >= self.globals.len) {
                         @branchHint(.unlikely);
                         return error.GlobalIndexOutOfBounds;
                     }
-                    try self.stack.push(self.globals[udx]);
+                    try self.stack.push(self.globals[idx]);
                 },
-                0x21 => {
-                    const idx = try self.readI32();
-                    if (idx < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeLocalIndex;
-                    }
-                    const udx: usize = @intCast(idx);
-                    if (udx >= self.frame.locals.len) {
+                Op.LoadLocal => {
+                    const idx = try self.readNonNegativeI32(error.NegativeLocalIndex);
+                    if (idx >= self.frame.locals.len) {
                         @branchHint(.unlikely);
                         return error.LocalIndexOutOfBounds;
                     }
-                    try self.stack.push(self.frame.locals[udx]);
+                    try self.stack.push(self.frame.locals[idx]);
                 },
-                0x40 => {
-                    const idx = try self.readI32();
-                    if (idx < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeGlobalIndex;
-                    }
-                    const udx: usize = @intCast(idx);
-                    if (udx >= self.globals.len) {
+                Op.StoreGlobal => {
+                    const idx = try self.readNonNegativeI32(error.NegativeGlobalIndex);
+                    if (idx >= self.globals.len) {
                         @branchHint(.unlikely);
                         return error.GlobalIndexOutOfBounds;
                     }
-                    self.globals[udx] = try self.stackHead();
+                    self.globals[idx] = try self.stackHead();
                 },
-                0x41 => {
-                    const idx = try self.readI32();
-                    if (idx < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeLocalIndex;
-                    }
-                    const udx: usize = @intCast(idx);
-                    if (udx >= self.frame.locals.len) {
+                Op.StoreLocal => {
+                    const idx = try self.readNonNegativeI32(error.NegativeLocalIndex);
+                    if (idx >= self.frame.locals.len) {
                         @branchHint(.unlikely);
                         return error.LocalIndexOutOfBounds;
                     }
-                    self.frame.locals[udx] = try self.stackHead();
+                    self.frame.locals[idx] = try self.stackHead();
                 },
-                0x70 => {
+                Op.Read => {
                     try self.stack.push(boxInt(try self.readInputInteger()));
                 },
-                0x71 => {
+                Op.Write => {
                     const value = try self.stackPop();
                     if ((value & 1) == 0) {
                         @branchHint(.unlikely);
@@ -1256,7 +1177,7 @@ pub const VM = struct {
                     try std.Io.File.stdout().writeStreamingAll(self.io, text);
                     try self.stack.push(0);
                 },
-                0x73 => {
+                Op.ToString => {
                     const value = try self.stackPop();
                     var buff: std.ArrayList(u8) = .empty;
                     defer buff.deinit(self.alloc);
@@ -1364,7 +1285,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    var vm = VM{
+    var vm = Vm{
         .code = byteCode.code,
         .instruction_starts = instruction_starts,
         .strings = byteCode.strings,
