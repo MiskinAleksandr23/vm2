@@ -530,7 +530,7 @@ pub const Vm = struct {
                     const tail = self.strings[offset..];
                     const end = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
                     const constructor_name = tail[0..end];
-                    const name = try self.alloc.dupeZ(u8, constructor_name);
+                    const name = try self.alloc.dupeSentinel(u8, constructor_name, 0);
                     const encoded: Value = @intCast(LtagHash(name.ptr));
                     const tag = try unboxIntChecked(encoded);
 
@@ -980,7 +980,7 @@ pub const Vm = struct {
                     const end = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
 
                     const constructor_name = tail[0..end];
-                    const name = try self.alloc.dupeZ(u8, constructor_name);
+                    const name = try self.alloc.dupeSentinel(u8, constructor_name, 0);
                     const encoded: Value = @intCast(LtagHash(name.ptr));
                     const tag = try unboxIntChecked(encoded);
                     const value = try self.stackPop();
