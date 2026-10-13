@@ -279,7 +279,7 @@ pub const Vm = struct {
         };
     }
 
-    inline fn ensureEnoughBytes(self: *Self, need: usize) !void {
+    fn ensureEnoughBytes(self: *Self, need: usize) !void {
         if (need > self.code.len - self.ip) {
             @branchHint(.unlikely);
             std.debug.print(
@@ -302,7 +302,7 @@ pub const Vm = struct {
         return value;
     }
 
-    inline fn CheckAddress(self: *Self, addr: usize) !void {
+    fn CheckAddress(self: *Self, addr: usize) !void {
         if (addr >= self.code.len) {
             @branchHint(.unlikely);
             return error.JumpAddressOutOfBounds;
@@ -326,7 +326,7 @@ pub const Vm = struct {
         return try self.stack.head();
     }
 
-    inline fn readNonNegativeI32(self: *Self, comptime negative_error: anyerror) !usize {
+    fn readNonNegativeI32(self: *Self, comptime negative_error: anyerror) !usize {
         const value = try self.readI32();
         if (value < 0) {
             @branchHint(.unlikely);
