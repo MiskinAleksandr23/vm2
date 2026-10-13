@@ -10,32 +10,29 @@ comptime {
 extern fn LtagHash(name: [*:0]const u8) i64;
 extern fn de_hash(tag: i64) [*:0]const u8;
 
-const StackSize = 1 << 15; // TODO
+const kStackSize = 1 << 15;
 const Value = usize;
 
-pub fn boxInt(n: isize) Value {
-    const bits: usize = @bitCast(n);
-    return (bits << 1) | 1;
+inline fn boxInt(n: isize) Value {
+    return (@as(usize, @bitCast(n)) << 1) | 1;
 }
 
-pub inline fn unboxIntUnchecked(value: Value) isize {
-    const signed: isize = @bitCast(value);
-    return signed >> 1;
+inline fn unboxIntUnchecked(value: Value) isize {
+    return @as(isize, @bitCast(value)) >> 1;
 }
 
-pub inline fn unboxIntChecked(value: Value) !isize {
+inline fn unboxIntChecked(value: Value) !isize {
     if ((value & 1) == 0) {
         @branchHint(.unlikely);
         return error.ExpectedInteger;
     }
-    const signed: isize = @bitCast(value);
-    return signed >> 1;
+    return @as(isize, @bitCast(value)) >> 1;
 }
 
 fn Stack(comptime T: type) type {
     return struct {
         const Self = @This();
-        data: [StackSize]T = undefined,
+        data: [kStackSize]T = undefined,
         len: usize = 0,
 
         pub fn init() Self {
@@ -54,7 +51,7 @@ fn Stack(comptime T: type) type {
         }
 
         pub fn push(self: *Self, element: T) !void {
-            if (self.len >= StackSize) {
+            if (self.len >= kStackSize) {
                 @branchHint(.unlikely);
                 return error.StackOverflow;
             }
@@ -136,7 +133,7 @@ pub const VM = struct {
     code: []const u8,
     instruction_starts: []const bool,
     strings: []const u8,
-    ip: usize, // invariant: 0 <= ip <= code.len
+    ip: usize,
 
     globals: []Value,
     stack: Stack(Value),
@@ -1349,9 +1346,9 @@ pub fn main(init: std.process.Init) !void {
     const filename = args[1];
     const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, filename, init.arena.allocator(), .limited(64 * 1024 * 1024));
 
-    std.debug.print("Bytes: {s}\n", .{bytes});
+    // std.debug.print("Bytes: {s}\n", .{bytes});
     const byteCode = try checkBytecodeHeaders(bytes);
-    std.debug.print("byteCode = {any}\n", .{byteCode});
+    // std.debug.print("byteCode = {any}\n", .{byteCode});
 
     const instruction_starts = try markInstructionStarts(init.arena.allocator(), byteCode.code);
     const public_count: usize = @intCast(std.mem.readInt(i32, bytes[8..12], .little));
