@@ -853,32 +853,36 @@ pub const Vm = struct {
                         const d: usize = @intCast(try self.readByte());
                         const id = try self.readNonNegativeI32(error.NegativeClosureCaptureIndex);
 
-                        if (d == 0) {
-                            if (id >= self.globals.len) {
-                                @branchHint(.unlikely);
-                                return error.GlobalIndexOutOfBounds;
-                            }
-                            captures[idx] = self.globals[id];
-                        } else if (d == 1) {
-                            if (id >= self.frame.locals.len) {
-                                @branchHint(.unlikely);
-                                return error.LocalIndexOutOfBounds;
-                            }
-                            captures[idx] = self.frame.locals[id];
-                        } else if (d == 2) {
-                            if (id >= self.frame.args.len) {
-                                @branchHint(.unlikely);
-                                return error.ArgumentIndexOutOfBounds;
-                            }
-                            captures[idx] = self.frame.args[id];
-                        } else if (d == 3) {
-                            if (id >= self.frame.closure.len) {
-                                @branchHint(.unlikely);
-                                return error.ClosureIndexOutOfBounds;
-                            }
-                            captures[idx] = self.frame.closure[id];
-                        } else {
-                            return error.InvalidClosureCaptureScope;
+                        switch (d) {
+                            0 => {
+                                if (id >= self.globals.len) {
+                                    @branchHint(.unlikely);
+                                    return error.GlobalIndexOutOfBounds;
+                                }
+                                captures[idx] = self.globals[id];
+                            },
+                            1 => {
+                                if (id >= self.frame.locals.len) {
+                                    @branchHint(.unlikely);
+                                    return error.LocalIndexOutOfBounds;
+                                }
+                                captures[idx] = self.frame.locals[id];
+                            },
+                            2 => {
+                                if (id >= self.frame.args.len) {
+                                    @branchHint(.unlikely);
+                                    return error.ArgumentIndexOutOfBounds;
+                                }
+                                captures[idx] = self.frame.args[id];
+                            },
+                            3 => {
+                                if (id >= self.frame.closure.len) {
+                                    @branchHint(.unlikely);
+                                    return error.ClosureIndexOutOfBounds;
+                                }
+                                captures[idx] = self.frame.closure[id];
+                            },
+                            else => return error.InvalidClosureCaptureScope,
                         }
                     }
                     const object = @intFromPtr(buff.ptr + 16);
@@ -886,8 +890,7 @@ pub const Vm = struct {
                     try self.stack.push(object);
                 },
                 Op.Line => {
-                    const line = try self.readI32();
-                    self.current_line = line;
+                    self.current_line = try self.readI32();
                 },
                 Op.CallClosure => {
                     const count = try self.readNonNegativeI32(error.NegativeArgumentCount);
@@ -896,9 +899,7 @@ pub const Vm = struct {
                     {
                         return error.StackUnderflow;
                     }
-                    if (self.call_stack.len >= self.call_stack.data.len) {
-                        return error.CallStackOverflow;
-                    }
+                    if (self.call_stack.len >= self.call_stack.data.len) return error.CallStackOverflow;
 
                     var new_frame: Frame = undefined;
                     const args = try self.alloc.alloc(Value, count);
@@ -907,9 +908,7 @@ pub const Vm = struct {
                     }
 
                     const object = try self.stackPop();
-                    if (!self.objects.contains(object)) {
-                        return error.ExpectedClosure;
-                    }
+                    if (!self.objects.contains(object)) return error.ExpectedClosure;
                     const header = try self.objectHeaderChecked(object);
                     const length = header.data_header >> 3;
                     if ((header.data_header & 7) != 7) return error.ExpectedClosure;
@@ -917,9 +916,7 @@ pub const Vm = struct {
                     const function_addr: *const usize = @ptrFromInt(object);
                     const uaddr = function_addr.*;
                     try self.CheckAddress(uaddr);
-                    if (self.code[uaddr] != 0x52 and self.code[uaddr] != 0x53) {
-                        return error.CallTargetNotFunction;
-                    }
+                    if (self.code[uaddr] != 0x52 and self.code[uaddr] != 0x53) return error.CallTargetNotFunction;
                     if (self.code.len - uaddr < 9) return error.TruncatedInstruction;
                     const declared_args = std.mem.readInt(i32, self.code[uaddr + 1 ..][0..4], .little);
                     if (declared_args < 0) return error.NegativeArgumentCount;
@@ -942,31 +939,21 @@ pub const Vm = struct {
                     try self.CheckAddress(addr);
 
                     const args_cnt = try self.readNonNegativeI32(error.NegativeArgumentCount);
-                    if (self.code[addr] != 0x52) {
-                        return error.CallTargetNotFunction;
-                    }
-                    if (self.code.len - addr < 9) {
-                        return error.TruncatedInstruction;
-                    }
+                    if (self.code[addr] != 0x52) return error.CallTargetNotFunction;
+                    if (self.code.len - addr < 9) return error.TruncatedInstruction;
                     const declared_args = std.mem.readInt(
                         i32,
                         self.code[addr + 1 ..][0..4],
                         .little,
                     );
-                    if (declared_args < 0) {
-                        return error.NegativeArgumentCount;
-                    }
-                    if (args_cnt != declared_args) {
-                        return error.ArgumentCountMismatch;
-                    }
+                    if (declared_args < 0) return error.NegativeArgumentCount;
+                    if (args_cnt != declared_args) return error.ArgumentCountMismatch;
                     if (self.stack.len < self.frame.stack_base or
                         args_cnt > self.stack.len - self.frame.stack_base)
                     {
                         return error.StackUnderflow;
                     }
-                    if (self.call_stack.len >= self.call_stack.data.len) {
-                        return error.CallStackOverflow;
-                    }
+                    if (self.call_stack.len >= self.call_stack.data.len) return error.CallStackOverflow;
 
                     var new_frame: Frame = undefined;
                     new_frame.args = try self.alloc.alloc(Value, args_cnt);
@@ -987,9 +974,7 @@ pub const Vm = struct {
                     const offset = try self.readNonNegativeI32(error.NegativeStringOffset);
                     const count = try self.readNonNegativeI32(error.NegativeSexpFieldCount);
 
-                    if (offset >= self.strings.len) {
-                        return error.StringOffsetOutOfBounds;
-                    }
+                    if (offset >= self.strings.len) return error.StringOffsetOutOfBounds;
 
                     const tail = self.strings[offset..];
                     const end = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
