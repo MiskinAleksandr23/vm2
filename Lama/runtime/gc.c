@@ -283,11 +283,11 @@ void compact_phase (size_t additional_size) {
 
   memory_chunk old_heap = heap;
   heap.begin            = mmap(NULL, WORDS_TO_BYTES(next_heap_pseudo_size), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  memcpy(heap.begin, old_heap.begin, WORDS_TO_BYTES(old_heap.size));
   if (heap.begin == MAP_FAILED) {
     perror("ERROR: compact_phase: mmap failed\n");
     exit(1);
   }
+  memcpy(heap.begin, old_heap.begin, WORDS_TO_BYTES(old_heap.size));
   heap.end     = heap.begin + next_heap_pseudo_size;
   heap.size    = next_heap_pseudo_size;
   heap.current = heap.begin + (old_heap.current - old_heap.begin);
@@ -296,7 +296,7 @@ void compact_phase (size_t additional_size) {
   physically_relocate(&old_heap);
 
   heap.current = heap.begin + live_size;
-  if (munmap(old_heap.begin, old_heap.size) < 0) {
+  if (munmap(old_heap.begin, WORDS_TO_BYTES(old_heap.size)) < 0) {
       perror("ERROR: compact_phase: munmap failed\n");
       exit(1);
   }
@@ -605,7 +605,7 @@ void __init (void) {
 }
 
 extern void __shutdown (void) {
-  munmap(heap.begin, heap.size);
+  munmap(heap.begin, WORDS_TO_BYTES(heap.size));
 #ifdef DEBUG_VERSION
   cur_id = 0;
 #endif
