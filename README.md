@@ -61,3 +61,11 @@ lamac -runtime ../Lama/runtime ../Lama/performance/Sort.lama
 /usr/bin/time -p ./Sort < /dev/null
 ```
 
+Локальные результаты(запуск под ARM, так что возможно чуть будет отличаться).
+
+| Вариант | Real, с | User, с | System, с | Пик RAM, МиБ |
+|---|---:|---:|---:|---:|
+| Нативная Lama (x86_64/Rosetta) | 104,30 | 94,33 | 4,12 | 7,15 |
+| `lamac -s` (ARM64) | 155,88 | 124,90 | 25,21 | 3665,61 |
+| Наша VM (ReleaseFast, x86_64/Rosetta) | 218,09 | 174,84 | 30,76 | 3216,23 |
+| `lamac -i` (ARM64) | 554,82 | 411,66 | 112,04 | 4836,06 |
