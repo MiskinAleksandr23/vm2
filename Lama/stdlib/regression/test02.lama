@@ -1,0 +1,59 @@
+import Matcher;
+
+var m = initMatcher ("   -- asdasdakm ,m.,msd .,m.,asd\n    \n\n abc");
+
+var
+  lident  = createRegexp ("[a-z][a-zA-Z_]*", "lowercase identifier"),
+  uident  = createRegexp ("[A-Z][a-zA-Z_]*", "uppercase identifier"),
+  ws      = createRegexp ("\\([ \t\n]\\|--[^\n]*\n\\)*", "whitespace"),
+  strlit  = createRegexp ("""\([^""]\|""""\)*""", "string literal"),
+  decimal = createRegexp ("[0-9]+", "decimal literal"),
+  chr     = createRegexp ("'[^']'", "character literal");
+
+fun token (s) {
+  fun (m) {m.matchString (s)}
+}
+
+fun lid (m) {
+  matchRegexp (m, lident)
+}
+
+fun uid (m) {
+  matchRegexp (m, uident)
+}
+
+fun const (m) {
+  matchRegexp (m, decimal)
+}
+
+infixl @ before * (p, f) {
+  fun (m) {    
+    case p (m) of
+      Succ (x, m) -> Succ (f (x), m)
+    | err         -> err
+    esac
+  }
+}
+
+infixr |> after !! (l, r) {
+  fun (m) {
+    case l (m) of
+      Succ (s, m) -> r (s) (m)
+    | err         -> err
+    esac
+  }
+}
+
+infixr || after |> (l, r) {
+  fun (m) {  
+    case l (m) of
+      s@Succ (_, _) -> s 
+    | err           -> r (m)
+    esac
+  }
+}
+
+var expr = lid @ fun (s) {Lid (s)} || const @ fun (s) {Dec (s)},
+    assn = lid |> fun (id) {token (":=") |> fun (s) {expr @ fun (e) {Assn (id, e)}}};
+
+printf ("%s\n", case assn (initMatcher ("x:=3")) of Fail (err) -> err | Succ (s, _) -> s.string esac)

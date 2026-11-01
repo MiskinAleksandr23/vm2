@@ -1,0 +1,124 @@
+import Collection;
+import Ref;
+import Random;
+import Array;
+import Fun;
+import Data;
+
+fun genCyclicArrays (n, eq, cross) {
+  var f = ref (true);
+  
+  fun genrec (n, stacka, stackb, depth) {
+    fun peek (k, stack) {
+      case stack of
+        [x, prev] -> if k == 0 then x else peek (k-1, prev) fi
+      esac
+    }
+    
+    if n == 1
+    then
+      case if random (2)
+           then randomString (16)
+           else randomInt ()
+           fi of
+        x -> [x, clone (x)]
+      esac           
+    else
+      var a     = split (n, random (n+1)),
+            b     = mapArray (id, a),
+            index = initArray (random (a.length + 1), fun (_) {random (a.length)});
+      
+      fun shared (i)  {
+        var found = false;
+        
+        for var j=0;, j < index.length && 1 - found, j := j + 1
+        do
+          found := i == index[j]
+        od;
+
+        found
+      }
+      
+      for var i=0;, i < a.length, i := i + 1
+      do
+        if shared (i)
+        then
+          if depth == 0
+          then
+            a[i] := a;
+            b[i] := if cross then a else b fi
+          else
+            case random (depth) of
+              r -> a [i] := peek (r, stacka);
+                   b [i] := if cross then a[i] else peek (r, stackb) fi
+            esac
+          fi;
+          
+          if 1 - eq && deref (f) then b[i] := 0; f ::= true fi
+        else
+          case genrec (a[i], [a, stacka], [b, stackb], depth + 1) of
+            [ai, bi] -> a [i] := ai;
+                        b [i] := bi;
+                        
+                        if 1 - eq && deref (f) then
+                          case b[i] of
+                            #val -> b[i] := b[i] + 1
+                          | _    -> b[i] := 0
+                          esac;
+                          f ::= true
+                        fi
+          esac
+        fi
+      od;
+
+      [a, b]
+    fi
+  }
+
+  genrec (n, [], [], 0)
+}
+
+fun normalize (x) {
+    if x < 0 then -1
+  elif x > 0 then 1
+  else 0
+    fi
+}
+
+fun not (x) {0 - x}
+
+for var i=0;, i<25, i:=i+1
+do
+  case genCyclicArrays (1000, true, false) of
+    [a, b] ->
+      printf ("%d\n", (a =?= a) == 0);
+      printf ("%d\n", (a =?= b) == 0)
+  esac
+od;
+
+for var i=0;, i<25, i:=i+1
+do
+  case genCyclicArrays (1000, true, true) of
+    [a, b] ->
+      printf ("%d\n", (a =?= a) == 0);
+      printf ("%d\n", (a =?= b) == 0)
+  esac
+od;
+
+for var i=0;, i<25, i:=i+1
+do
+  case genCyclicArrays (1000, false, false) of
+   [a, b] -> var x = normalize (a =?= b);
+             printf ("%d\n", x != 0);
+             printf ("%d\n", not (x) == normalize (b =?= a))
+  esac
+od;
+
+for var i=0;, i<25, i:=i+1
+do
+  case genCyclicArrays (1000, false, true) of
+   [a, b] -> var x = normalize (a =?= b);
+             printf ("%d\n", x != 0);
+             printf ("%d\n", not (x) == normalize (b =?= a))
+  esac
+od

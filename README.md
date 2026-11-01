@@ -42,12 +42,22 @@ zig build -Doptimize=ReleaseFast
 
 
 ### Запуск тестов(регрессионные тесты Lama)
-```bash 
-TODO
+
+```bash
+python3 tests/run_lama_regression.py --suite all --no-build --timeout 1200
 ```
 
 ### Бенчмарк(единственный)
-```bash 
-TODO
+
+```bash
+zig build -Doptimize=ReleaseFast
+lamac -runtime ../Lama/runtime -b ../Lama/performance/Sort.lama
+/usr/bin/time -p ./zig-out/bin/lama_vm Sort.bc < /dev/null
+
+/usr/bin/time -p lamac -s ../Lama/performance/Sort.lama < /dev/null
+/usr/bin/time -p lamac -i ../Lama/performance/Sort.lama < /dev/null
+
+lamac -runtime ../Lama/runtime ../Lama/performance/Sort.lama
+/usr/bin/time -p ./Sort < /dev/null
 ```
 
