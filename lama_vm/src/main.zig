@@ -717,7 +717,8 @@ pub const Vm = struct {
                     const uaddr = function_addr.*;
                     try self.CheckAddress(uaddr);
                     if (self.code[uaddr] != 0x52 and self.code[uaddr] != 0x53) return error.CallTargetNotFunction;
-                    if (self.code.len - uaddr < 9) return error.TruncatedInstruction;
+                    const begin_size = @sizeOf(u8) + 2 * @sizeOf(i32);
+                    if (self.code.len - uaddr < begin_size) return error.TruncatedInstruction;
                     const declared_args = std.mem.readInt(i32, self.code[uaddr + 1 ..][0..4], .little);
                     if (declared_args < 0) return error.NegativeArgumentCount;
                     if (count != declared_args) return error.ArgumentCountMismatch;
