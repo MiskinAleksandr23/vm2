@@ -26,7 +26,6 @@ extern fn Bsexp_tag_patt(value: Value) Value;
 extern fn Bclosure_tag_patt(value: Value) Value;
 extern fn Bboxed_patt(value: Value) Value;
 extern fn Bunboxed_patt(value: Value) Value;
-extern fn is_valid_heap_pointer(pointer: *const anyopaque) bool;
 extern fn __init() void;
 extern fn __shutdown() void;
 extern var __gc_stack_top: usize;
@@ -39,7 +38,6 @@ const buffer_size = 64 * 1024 * 1024;
 const bytecode_header_size = 3 * @sizeOf(i32);
 const public_symbol_size = 2 * @sizeOf(i32) + @sizeOf(u8);
 var file_buffer: [buffer_size]u8 = undefined;
-var reference_marker: usize = 0;
 var vm: Vm = undefined;
 const Value = usize;
 
@@ -104,45 +102,57 @@ pub fn Stack(comptime T: type, comptime capacity: usize) type {
 }
 
 const OperandStack = struct {
-    data: []Value,
-    len: usize = 1,
+    const Self = @This();
 
-    fn init(data: []Value) @This() {
+    data: []Value,
+
+    fn init(data: []Value) Self {
         data[0] = 0;
+        __gc_stack_top = @intFromPtr(data.ptr);
+        __gc_stack_bottom = __gc_stack_top + @sizeOf(Value);
         return .{ .data = data };
     }
 
-    inline fn count(self: *const @This()) usize {
-        return self.len;
+    inline fn count(_: *const Self) usize {
+        return (__gc_stack_bottom - __gc_stack_top) / @sizeOf(Value);
     }
 
-    inline fn push(self: *@This(), value: Value) !void {
-        if (self.len == self.data.len) return error.StackOverflow;
-        self.data[self.len] = value;
-        self.len += 1;
+    inline fn push(self: *Self, value: Value) !void {
+        if (__gc_stack_bottom == @intFromPtr(self.data.ptr + self.data.len)) return error.StackOverflow;
+        const slot: *Value = @ptrFromInt(__gc_stack_bottom);
+        slot.* = value;
+        __gc_stack_bottom += @sizeOf(Value);
     }
 
-    inline fn pop(self: *@This()) Value {
-        self.len -= 1;
-        return self.data[self.len];
+    inline fn pop(_: *Self) Value {
+        __gc_stack_bottom -= @sizeOf(Value);
+        const slot: *Value = @ptrFromInt(__gc_stack_bottom);
+        return slot.*;
     }
 
-    inline fn head(self: *const @This()) Value {
-        return self.data[self.len - 1];
+    inline fn head(_: *const Self) Value {
+        const slot: *const Value = @ptrFromInt(__gc_stack_bottom - @sizeOf(Value));
+        return slot.*;
     }
 
-    fn reserve(self: *@This(), amount: usize) ![]Value {
-        const start = self.len;
+    fn reserve(self: *Self, amount: usize) ![]Value {
+        const start = self.count();
         if (amount > self.data.len - start) return error.StackOverflow;
         const values = self.data[start..][0..amount];
         @memset(values, 0);
-        self.len += amount;
+        __gc_stack_bottom += amount * @sizeOf(Value);
         return values;
     }
 
-    inline fn truncate(self: *@This(), new_count: usize) void {
-        self.len = new_count;
+    inline fn truncate(_: *Self, new_count: usize) void {
+        __gc_stack_bottom = __gc_stack_top + new_count * @sizeOf(Value);
     }
+};
+
+const Reference = extern struct {
+    captured: Value,
+    owner: Value,
+    index: Value,
 };
 
 const Frame = struct {
@@ -279,34 +289,11 @@ pub const Vm = struct {
         return data[0 .. (header.data_header >> 3) - 1];
     }
 
-    fn inHeap(value: Value) bool {
-        return value != 0 and (value & 7) == 0 and is_valid_heap_pointer(@ptrFromInt(value));
-    }
-
-    fn isReference(value: Value) bool {
-        if (!inHeap(value)) return false;
-        const header: *const ObjectHeader = @ptrFromInt(value - @sizeOf(ObjectHeader));
-        if (header.data_header != ((3 << 3) | 3)) return false;
-        const fields: [*]const Value = @ptrFromInt(value);
-        return fields[0] == @intFromPtr(&reference_marker);
-    }
-
-    fn isObject(value: Value) bool {
-        return inHeap(value) and !isReference(value);
-    }
-
-    fn prepareRuntime(self: *Self) void {
-        __gc_stack_top = @intFromPtr(self.stack.data.ptr);
-        __gc_stack_bottom = @intFromPtr(self.stack.data.ptr + self.stack.len);
-    }
-
-    fn createReference(self: *Self, owner: Value, index: usize) !Value {
+    fn createReference(self: *Self, owner: Value, index: usize, captured: bool) !Value {
         const start = self.stack.count();
-        const fields = try self.stack.reserve(3);
-        fields[0] = @intFromPtr(&reference_marker);
-        fields[1] = owner;
-        fields[2] = boxInt(@intCast(index));
-        self.prepareRuntime();
+        const fields = try self.stack.reserve(@sizeOf(Reference) / @sizeOf(Value));
+        const reference: *Reference = @ptrCast(@alignCast(fields.ptr));
+        reference.* = .{ .captured = boxInt(@intFromBool(captured)), .owner = owner, .index = boxInt(@intCast(index)) };
         const result = Barray(fields.ptr, boxInt(@intCast(fields.len)));
         self.stack.truncate(start);
         return result;
@@ -315,14 +302,12 @@ pub const Vm = struct {
     fn unary(self: *Self, comptime operation: anytype) !void {
         const value = try self.stackHead();
         const index = self.stack.count() - 1;
-        self.prepareRuntime();
         self.stack.data[index] = operation(value);
     }
 
     fn binary(self: *Self, comptime operation: anytype) !void {
         if (self.stack.count() - self.frame.stack_base < 2) return error.StackUnderflow;
         const index = self.stack.count() - 2;
-        self.prepareRuntime();
         const result = operation(self.stack.data[index], self.stack.data[index + 1]);
         self.stack.truncate(index + 1);
         self.stack.data[index] = result;
@@ -404,15 +389,10 @@ pub const Vm = struct {
     }
 
     fn referenceChecked(self: *Self, ref: Value) !*Value {
-        if (!isReference(ref)) return error.InvalidReference;
-        const fields: [*]const Value = @ptrFromInt(ref);
-        const owner = fields[1];
-        const index: usize = @intCast(try unboxIntChecked(fields[2]));
-        if (isObject(owner)) {
-            const header = try self.objectHeaderChecked(owner);
-            if ((header.data_header & 7) != 7 or index >= (header.data_header >> 3) - 1) {
-                return error.InvalidReference;
-            }
+        const reference: *const Reference = @ptrFromInt(ref);
+        const owner = reference.owner;
+        const index: usize = @intCast(try unboxIntChecked(reference.index));
+        if (reference.captured != boxInt(0)) {
             const captures: [*]Value = @ptrFromInt(owner + @sizeOf(Value));
             return &captures[index];
         }
@@ -429,12 +409,6 @@ pub const Vm = struct {
             if (referenceInSlice(owner, saved.frame.args)) |ptr| return ptr;
         }
         return error.InvalidReference;
-    }
-
-    fn objectHeaderChecked(self: *Self, value: Value) !*const ObjectHeader {
-        _ = self;
-        if (!isObject(value)) return error.ExpectedStringOrArray;
-        return @ptrFromInt(value - @sizeOf(ObjectHeader));
     }
 
     pub fn run(self: *Self) !void {
@@ -502,9 +476,7 @@ pub const Vm = struct {
                     const end = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
                     const name: [:0]const u8 = tail[0..end :0];
                     const start = self.stack.count() - count;
-                    self.prepareRuntime();
                     try self.stack.push(LtagHash(name.ptr));
-                    self.prepareRuntime();
                     const object = Bsexp(self.stack.data[start..].ptr, boxInt(@intCast(count + 1)));
                     self.stack.truncate(start);
                     try self.stack.push(object);
@@ -516,19 +488,16 @@ pub const Vm = struct {
                     _ = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
                     const start = self.stack.count();
                     try self.stack.push(@intFromPtr(tail.ptr));
-                    self.prepareRuntime();
                     const object = Bstring(self.stack.data[start..].ptr);
                     self.stack.data[start] = object;
                 },
                 Op.Length => {
-                    _ = try self.objectHeaderChecked(try self.stackHead());
                     try self.unary(Llength);
                 },
                 Op.Array => {
                     const count = try self.readNonNegativeI32(error.NegativeArrayLength);
                     if (count > self.stack.count() - self.frame.stack_base) return error.StackUnderflow;
                     const start = self.stack.count() - count;
-                    self.prepareRuntime();
                     const object = Barray(self.stack.data[start..].ptr, boxInt(@intCast(count)));
                     self.stack.truncate(start);
                     try self.stack.push(object);
@@ -537,12 +506,9 @@ pub const Vm = struct {
                     const count = try self.readNonNegativeI32(error.NegativeArrayLength);
                     const value = try self.stackHead();
                     const index = self.stack.count() - 1;
-                    self.prepareRuntime();
-                    self.stack.data[index] = if (isObject(value)) Barray_patt(value, boxInt(@intCast(count))) else boxInt(0);
+                    self.stack.data[index] = Barray_patt(value, boxInt(@intCast(count)));
                 },
                 Op.Elem => {
-                    if (self.stack.count() - self.frame.stack_base < 2) return error.StackUnderflow;
-                    _ = try self.objectHeaderChecked(self.stack.data[self.stack.count() - 2]);
                     try self.binary(Belem);
                 },
                 Op.StoreElement => {
@@ -557,8 +523,6 @@ pub const Vm = struct {
                     } else {
                         if (self.stack.count() - self.frame.stack_base < 3) return error.StackUnderflow;
                         const start = self.stack.count() - 3;
-                        _ = try self.objectHeaderChecked(self.stack.data[start]);
-                        self.prepareRuntime();
                         const result = Bsta(self.stack.data[start], index_or_ref, self.stack.data[start + 2]);
                         self.stack.truncate(start);
                         try self.stack.push(result);
@@ -569,21 +533,21 @@ pub const Vm = struct {
                     if (idx >= self.globals.len) {
                         return error.GlobalIndexOutOfBounds;
                     }
-                    try self.stack.push(try self.createReference(@intFromPtr(&self.globals[idx]), 0));
+                    try self.stack.push(try self.createReference(@intFromPtr(&self.globals[idx]), 0, false));
                 },
                 Op.LoadAddressLocal => {
                     const idx = try self.readNonNegativeI32(error.NegativeLocalIndex);
                     if (idx >= self.frame.locals.len) {
                         return error.LocalIndexOutOfBounds;
                     }
-                    try self.stack.push(try self.createReference(@intFromPtr(&self.frame.locals[idx]), self.frame.id));
+                    try self.stack.push(try self.createReference(@intFromPtr(&self.frame.locals[idx]), self.frame.id, false));
                 },
                 Op.LoadAddressArg => {
                     const idx = try self.readNonNegativeI32(error.NegativeArgumentIndex);
                     if (idx >= self.frame.args.len) {
                         return error.ArgumentIndexOutOfBounds;
                     }
-                    try self.stack.push(try self.createReference(@intFromPtr(&self.frame.args[idx]), self.frame.id));
+                    try self.stack.push(try self.createReference(@intFromPtr(&self.frame.args[idx]), self.frame.id, false));
                 },
                 Op.StoreIndirect => {
                     const new_value = try self.stackPop();
@@ -667,7 +631,7 @@ pub const Vm = struct {
                     if (idx >= self.closureValues(self.frame).len) {
                         return error.ClosureIndexOutOfBounds;
                     }
-                    try self.stack.push(try self.createReference(self.stack.data[self.frame.closure.?], idx));
+                    try self.stack.push(try self.createReference(self.stack.data[self.frame.closure.?], idx, true));
                 },
                 Op.StoreClosure => {
                     const idx = try self.readNonNegativeI32(error.NegativeClosureIndex);
@@ -738,7 +702,6 @@ pub const Vm = struct {
                             else => return error.InvalidClosureCaptureScope,
                         }
                     }
-                    self.prepareRuntime();
                     const object = Bclosure(fields.ptr, boxInt(@intCast(count)));
                     self.stack.truncate(start);
                     try self.stack.push(object);
@@ -756,11 +719,9 @@ pub const Vm = struct {
                     if (self.call_stack.len >= self.call_stack.data.len) return error.CallStackOverflow;
 
                     const slot = self.stack.count() - count - 1;
-                    if (!isObject(self.stack.data[slot])) return error.ExpectedClosure;
-                    self.prepareRuntime();
                     if (Bclosure_tag_patt(self.stack.data[slot]) == boxInt(0)) return error.ExpectedClosure;
                     const object = self.stack.data[slot];
-                    const header = try self.objectHeaderChecked(object);
+                    const header: *const ObjectHeader = @ptrFromInt(object - @sizeOf(ObjectHeader));
                     const length = header.data_header >> 3;
                     if ((header.data_header & 7) != 7) return error.ExpectedClosure;
                     if (length == 0) return error.InvalidClosure;
@@ -831,55 +792,25 @@ pub const Vm = struct {
                     const tail = self.strings[offset..];
                     const end = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
                     const name: [:0]const u8 = tail[0..end :0];
-                    self.prepareRuntime();
                     const tag = LtagHash(name.ptr);
                     const value = try self.stackHead();
                     const index = self.stack.count() - 1;
-                    self.prepareRuntime();
-                    self.stack.data[index] = if (isObject(value)) Btag(value, tag, boxInt(@intCast(count))) else boxInt(0);
+                    self.stack.data[index] = Btag(value, tag, boxInt(@intCast(count)));
                 },
                 Op.StringEqual => {
-                    if (self.stack.count() - self.frame.stack_base < 2) return error.StackUnderflow;
-                    const index = self.stack.count() - 2;
-                    const left = self.stack.data[index];
-                    const right = self.stack.data[index + 1];
-                    if (isObject(left) and isObject(right) and
-                        ((try self.objectHeaderChecked(left)).data_header & 7) == 1 and
-                        ((try self.objectHeaderChecked(right)).data_header & 7) == 1)
-                    {
-                        try self.binary(Bstring_patt);
-                    } else {
-                        self.stack.truncate(index + 1);
-                        self.stack.data[index] = boxInt(0);
-                    }
+                    try self.binary(Bstring_patt);
                 },
                 Op.IsString => {
-                    if (isObject(try self.stackHead())) {
-                        try self.unary(Bstring_tag_patt);
-                    } else {
-                        self.stack.data[self.stack.count() - 1] = boxInt(0);
-                    }
+                    try self.unary(Bstring_tag_patt);
                 },
                 Op.IsArray => {
-                    if (isObject(try self.stackHead())) {
-                        try self.unary(Barray_tag_patt);
-                    } else {
-                        self.stack.data[self.stack.count() - 1] = boxInt(0);
-                    }
+                    try self.unary(Barray_tag_patt);
                 },
                 Op.IsSexp => {
-                    if (isObject(try self.stackHead())) {
-                        try self.unary(Bsexp_tag_patt);
-                    } else {
-                        self.stack.data[self.stack.count() - 1] = boxInt(0);
-                    }
+                    try self.unary(Bsexp_tag_patt);
                 },
                 Op.IsClosure => {
-                    if (isObject(try self.stackHead())) {
-                        try self.unary(Bclosure_tag_patt);
-                    } else {
-                        self.stack.data[self.stack.count() - 1] = boxInt(0);
-                    }
+                    try self.unary(Bclosure_tag_patt);
                 },
                 Op.IsBoxed => {
                     try self.unary(Bboxed_patt);
@@ -963,7 +894,6 @@ pub const Vm = struct {
                     self.frame.locals[idx] = try self.stackHead();
                 },
                 Op.Read => {
-                    self.prepareRuntime();
                     try self.stack.push(Lread());
                 },
                 Op.Write => {
@@ -972,8 +902,6 @@ pub const Vm = struct {
                 Op.ToString => {
                     _ = try self.stackHead();
                     const index = self.stack.count() - 1;
-                    if ((self.stack.data[index] & 1) == 0) _ = try self.objectHeaderChecked(self.stack.data[index]);
-                    self.prepareRuntime();
                     self.stack.data[index] = Lstring(self.stack.data[index..].ptr);
                 },
                 else => return error.InvalidOpcode,
