@@ -64,6 +64,7 @@ def check_case(source, lama, compiler, vm, timeout, artifacts):
 
         command = [str(vm), str(code)]
         actual, problem = execute(command, source.parent, input_text, timeout)
+        actual.stdout = actual.stdout.replace("> ", "")
         if problem or actual.returncode != 0 or actual.stdout != expected:
             saved_code = artifacts / source.relative_to(lama).with_suffix(".bc")
             saved_code.parent.mkdir(parents=True, exist_ok=True)

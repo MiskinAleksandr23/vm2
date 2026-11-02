@@ -620,6 +620,7 @@ extern void __shutdown (void) {
 void clear_extra_roots (void) { extra_roots.current_free = 0; }
 
 void push_extra_root (void **p) {
+  if ((size_t)p >= __gc_stack_top + sizeof(size_t) && (size_t)p < __gc_stack_bottom) return;
   if (extra_roots.current_free >= MAX_EXTRA_ROOTS_NUMBER) {
     perror("ERROR: push_extra_roots: extra_roots_pool overflow\n");
     exit(1);
@@ -630,6 +631,7 @@ void push_extra_root (void **p) {
 }
 
 void pop_extra_root (void **p) {
+  if ((size_t)p >= __gc_stack_top + sizeof(size_t) && (size_t)p < __gc_stack_bottom) return;
   if (extra_roots.current_free == 0) {
     perror("ERROR: pop_extra_root: extra_roots are empty\n");
     exit(1);

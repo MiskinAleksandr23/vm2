@@ -1,5 +1,4 @@
 const std = @import("std");
-const Io = std.Io;
 
 comptime {
     if (@sizeOf(usize) != 8 or @sizeOf(isize) != 8) {
@@ -7,27 +6,39 @@ comptime {
     }
 }
 
-extern fn LtagHash(name: [*:0]const u8) i64;
-extern fn de_hash(tag: i64) [*:0]const u8;
-
+extern fn LtagHash(name: [*:0]const u8) Value;
+extern fn Lread() Value;
+extern fn Lwrite(value: Value) Value;
+extern fn Llength(value: Value) Value;
+extern fn Lstring(args: [*]Value) Value;
+extern fn Bstring(args: [*]Value) Value;
+extern fn Barray(args: [*]Value, count: Value) Value;
+extern fn Bsexp(args: [*]Value, count: Value) Value;
+extern fn Bclosure(args: [*]Value, count: Value) Value;
+extern fn Belem(object: Value, index: Value) Value;
+extern fn Bsta(object: Value, index: Value, value: Value) Value;
+extern fn Btag(object: Value, tag: Value, count: Value) Value;
+extern fn Barray_patt(object: Value, count: Value) Value;
+extern fn Bstring_patt(left: Value, right: Value) Value;
+extern fn Bstring_tag_patt(value: Value) Value;
+extern fn Barray_tag_patt(value: Value) Value;
+extern fn Bsexp_tag_patt(value: Value) Value;
+extern fn Bclosure_tag_patt(value: Value) Value;
+extern fn Bboxed_patt(value: Value) Value;
+extern fn Bunboxed_patt(value: Value) Value;
+extern fn is_valid_heap_pointer(pointer: *const anyopaque) bool;
 extern fn __init() void;
 extern fn __shutdown() void;
 extern var __gc_stack_top: usize;
 extern var __gc_stack_bottom: usize;
-extern fn alloc_string(length: usize) ?*ObjectHeader;
-extern fn alloc_array(length: usize) ?*ObjectHeader;
-extern fn alloc_sexp(length: usize) ?*ObjectHeader;
-extern fn alloc_closure(length: usize) ?*ObjectHeader;
-extern fn is_valid_heap_pointer(pointer: *const anyopaque) bool;
 
 export var gc_anchor: usize linksection("custom_data") = 1;
 
 const stack_size = 1 << 15;
 const buffer_size = 64 * 1024 * 1024;
+const bytecode_header_size = 3 * @sizeOf(i32);
+const public_symbol_size = 2 * @sizeOf(i32) + @sizeOf(u8);
 var file_buffer: [buffer_size]u8 = undefined;
-var input_buffer: [buffer_size]u8 = undefined;
-var string_buffer: [buffer_size]u8 = undefined;
-var instruction_buffer: [buffer_size]bool = undefined;
 var reference_marker: usize = 0;
 var vm: Vm = undefined;
 const Value = usize;
@@ -92,6 +103,48 @@ pub fn Stack(comptime T: type, comptime capacity: usize) type {
     };
 }
 
+const OperandStack = struct {
+    data: []Value,
+    len: usize = 1,
+
+    fn init(data: []Value) @This() {
+        data[0] = 0;
+        return .{ .data = data };
+    }
+
+    inline fn count(self: *const @This()) usize {
+        return self.len;
+    }
+
+    inline fn push(self: *@This(), value: Value) !void {
+        if (self.len == self.data.len) return error.StackOverflow;
+        self.data[self.len] = value;
+        self.len += 1;
+    }
+
+    inline fn pop(self: *@This()) Value {
+        self.len -= 1;
+        return self.data[self.len];
+    }
+
+    inline fn head(self: *const @This()) Value {
+        return self.data[self.len - 1];
+    }
+
+    fn reserve(self: *@This(), amount: usize) ![]Value {
+        const start = self.len;
+        if (amount > self.data.len - start) return error.StackOverflow;
+        const values = self.data[start..][0..amount];
+        @memset(values, 0);
+        self.len += amount;
+        return values;
+    }
+
+    inline fn truncate(self: *@This(), new_count: usize) void {
+        self.len = new_count;
+    }
+};
+
 const Frame = struct {
     args: []Value,
     locals: []Value,
@@ -110,6 +163,7 @@ const ByteCode = struct {
     code: []const u8,
     strings: []const u8,
     globals_count: usize,
+    entry_point: usize,
 };
 
 const ObjectHeader = extern struct {
@@ -190,40 +244,6 @@ const Op = enum(u8) {
     _,
 };
 
-fn markInstructionStarts(code: []const u8) ![]bool {
-    const starts = instruction_buffer[0..code.len];
-    @memset(starts, false);
-
-    var offset: usize = 0;
-    while (offset < code.len) {
-        if (code[offset] == 0xFF) {
-            if (offset != code.len - 1) {
-                return error.TrailingBytesAfterBytecodeTerminator;
-            }
-            return starts;
-        }
-
-        const size: usize = switch (code[offset]) {
-            0x01...0x0D, 0x13...0x14, 0x16...0x1B, 0x60...0x66, 0x70...0x73 => 1,
-            0x10...0x11, 0x15, 0x20...0x23, 0x30...0x33, 0x40...0x43, 0x50...0x51, 0x55, 0x58, 0x5A, 0x74 => 5,
-            0x12, 0x52...0x53, 0x56...0x57, 0x59 => 9,
-            0x54 => blk: {
-                if (code.len - offset < 9) return error.TruncatedInstruction;
-                const count = std.mem.readInt(i32, code[offset + 5 ..][0..4], .little);
-                if (count < 0) return error.NegativeClosureCaptureCount;
-                break :blk 9 + @as(usize, @intCast(count)) * 5;
-            },
-            else => return error.InvalidOpcode,
-        };
-        if (size > code.len - offset) {
-            return error.TruncatedInstruction;
-        }
-        starts[offset] = true;
-        offset += size;
-    }
-    return error.MissingBytecodeTerminator;
-}
-
 fn readBounded(reader: *std.Io.File.Reader, buffer: []u8, comptime too_large: anyerror) ![]const u8 {
     const size = reader.interface.readSliceShort(buffer) catch return reader.err.?;
     if (size == buffer.len) {
@@ -238,31 +258,18 @@ pub const Vm = struct {
     const Self = @This();
 
     code: []const u8,
-    instruction_starts: []const bool,
     strings: []const u8,
     ip: usize,
 
     globals: []Value,
-    stack: Stack(Value, stack_size * 8),
+    stack: OperandStack,
 
     frame: Frame,
     call_stack: Stack(SavedFrame, stack_size),
 
     current_line: ?i32,
 
-    io: std.Io,
-    input_data: ?[]const u8 = null,
-    input_pos: usize = 0,
     next_frame_id: usize = 2,
-
-    fn reserve(self: *Self, count: usize) ![]Value {
-        if (count > self.stack.data.len - self.stack.len) return error.StackOverflow;
-        const start = self.stack.len;
-        self.stack.len += count;
-        const values = self.stack.data[start..self.stack.len];
-        @memset(values, 0);
-        return values;
-    }
 
     fn closureValues(self: *Self, frame: Frame) []Value {
         const slot = frame.closure orelse return &.{};
@@ -270,18 +277,6 @@ pub const Vm = struct {
         const header: *const ObjectHeader = @ptrFromInt(value - @sizeOf(ObjectHeader));
         const data: [*]Value = @ptrFromInt(value + @sizeOf(Value));
         return data[0 .. (header.data_header >> 3) - 1];
-    }
-
-    fn allocateObject(self: *Self, comptime kind: enum { string, array, sexp, closure }, count: usize) !Value {
-        __gc_stack_top = @intFromPtr(&self.stack.data[0]);
-        __gc_stack_bottom = @intFromPtr(self.stack.data[0..self.stack.len].ptr + self.stack.len);
-        const header = (switch (kind) {
-            .string => alloc_string(count),
-            .array => alloc_array(count),
-            .sexp => alloc_sexp(count),
-            .closure => alloc_closure(count),
-        }) orelse return error.OutOfMemory;
-        return @intFromPtr(header) + @sizeOf(ObjectHeader);
     }
 
     fn inHeap(value: Value) bool {
@@ -300,14 +295,37 @@ pub const Vm = struct {
         return inHeap(value) and !isReference(value);
     }
 
+    fn prepareRuntime(self: *Self) void {
+        __gc_stack_top = @intFromPtr(self.stack.data.ptr);
+        __gc_stack_bottom = @intFromPtr(self.stack.data.ptr + self.stack.len);
+    }
+
     fn createReference(self: *Self, owner: Value, index: usize) !Value {
-        try self.stack.push(owner);
-        const value = try self.allocateObject(.array, 3);
-        const fields: [*]Value = @ptrFromInt(value);
+        const start = self.stack.count();
+        const fields = try self.stack.reserve(3);
         fields[0] = @intFromPtr(&reference_marker);
-        fields[1] = try self.stack.pop();
+        fields[1] = owner;
         fields[2] = boxInt(@intCast(index));
-        return value;
+        self.prepareRuntime();
+        const result = Barray(fields.ptr, boxInt(@intCast(fields.len)));
+        self.stack.truncate(start);
+        return result;
+    }
+
+    fn unary(self: *Self, comptime operation: anytype) !void {
+        const value = try self.stackHead();
+        const index = self.stack.count() - 1;
+        self.prepareRuntime();
+        self.stack.data[index] = operation(value);
+    }
+
+    fn binary(self: *Self, comptime operation: anytype) !void {
+        if (self.stack.count() - self.frame.stack_base < 2) return error.StackUnderflow;
+        const index = self.stack.count() - 2;
+        self.prepareRuntime();
+        const result = operation(self.stack.data[index], self.stack.data[index + 1]);
+        self.stack.truncate(index + 1);
+        self.stack.data[index] = result;
     }
 
     fn nextFrameId(self: *Self) !usize {
@@ -315,47 +333,6 @@ pub const Vm = struct {
         const id = self.next_frame_id;
         self.next_frame_id += 1;
         return id;
-    }
-
-    fn createString(self: *Self, bytes: []const u8) !Value {
-        const value = try self.allocateObject(.string, bytes.len);
-        const data: [*]u8 = @ptrFromInt(value);
-        @memcpy(data[0..bytes.len], bytes);
-        data[bytes.len] = 0;
-        return value;
-    }
-
-    fn readInputInteger(self: *Self) !isize {
-        if (self.input_data == null) {
-            var reader = std.Io.File.stdin().readerStreaming(self.io, &.{});
-            self.input_data = try readBounded(&reader, &input_buffer, error.InputTooLarge);
-        }
-        const input = self.input_data.?;
-        while (self.input_pos < input.len and std.ascii.isWhitespace(input[self.input_pos])) {
-            self.input_pos += 1;
-        }
-        if (self.input_pos == input.len) {
-            return error.UnexpectedEndOfInput;
-        }
-
-        const start = self.input_pos;
-        while (self.input_pos < input.len and !std.ascii.isWhitespace(input[self.input_pos])) {
-            self.input_pos += 1;
-        }
-        const token = input[start..self.input_pos];
-        const digits = if (token[0] == '+' or token[0] == '-') token[1..] else token;
-        if (digits.len == 0) {
-            return error.InvalidIntegerInput;
-        }
-        for (digits) |digit| {
-            if (!std.ascii.isDigit(digit)) {
-                return error.InvalidIntegerInput;
-            }
-        }
-        return std.fmt.parseInt(i63, token, 10) catch |err| switch (err) {
-            error.InvalidCharacter => return error.InvalidIntegerInput,
-            error.Overflow => return error.InputIntegerOutOfRange,
-        };
     }
 
     fn ensureEnoughBytes(self: *Self, need: usize) !void {
@@ -386,23 +363,20 @@ pub const Vm = struct {
             @branchHint(.unlikely);
             return error.JumpAddressOutOfBounds;
         }
-        if (!self.instruction_starts[addr]) {
-            return error.JumpTargetNotInstructionStart;
-        }
     }
 
     inline fn stackPop(self: *Self) !Value {
-        if (self.stack.len <= self.frame.stack_base) {
+        if (self.stack.count() <= self.frame.stack_base) {
             return error.StackUnderflow;
         }
-        return try self.stack.pop();
+        return self.stack.pop();
     }
 
     inline fn stackHead(self: *Self) !Value {
-        if (self.stack.len <= self.frame.stack_base) {
+        if (self.stack.count() <= self.frame.stack_base) {
             return error.StackUnderflow;
         }
-        return try self.stack.head();
+        return self.stack.head();
     }
 
     fn readNonNegativeI32(self: *Self, comptime negative_error: anyerror) !usize {
@@ -427,73 +401,6 @@ pub const Vm = struct {
         if (index >= values.len) return null;
 
         return &values[index];
-    }
-
-    fn appendValueText(self: *Self, value: Value, buff: *std.Io.Writer, path: *Stack(Value, 256)) anyerror!void {
-        if ((value & 1) != 0) {
-            const number = try unboxIntChecked(value);
-            var buffer: [32]u8 = undefined;
-            const bytes = try std.fmt.bufPrint(&buffer, "{d}", .{number});
-            try buff.writeAll(bytes);
-        } else {
-            const header = try self.objectHeaderChecked(value);
-            const tag = header.data_header & 7;
-            if (tag == 1) {
-                const length = header.data_header >> 3;
-                const data: [*]const u8 = @ptrFromInt(value);
-                try buff.writeByte('"');
-                try buff.writeAll(data[0..length]);
-                try buff.writeByte('"');
-            } else if (tag == 3) {
-                if (std.mem.findScalar(Value, path.data[0..path.len], value) != null) {
-                    return error.CyclicValue;
-                }
-                if (path.len >= 256) {
-                    return error.StringConversionTooDeep;
-                }
-                try path.push(value);
-                defer path.len -= 1;
-
-                const length = header.data_header >> 3;
-                const data: [*]const Value = @ptrFromInt(value);
-                try buff.writeByte('[');
-                for (0..length) |i| {
-                    if (i != 0) {
-                        try buff.writeAll(", ");
-                    }
-                    try self.appendValueText(data[i], buff, path);
-                }
-                try buff.writeByte(']');
-            } else if (tag == 5) {
-                const constructor_tag: *const usize = @ptrFromInt(value);
-                const id = constructor_tag.*;
-                const name = std.mem.span(de_hash(@intCast(id)));
-                try buff.writeAll(name);
-
-                const count = header.data_header >> 3;
-                if (std.mem.findScalar(Value, path.data[0..path.len], value) != null) {
-                    return error.CyclicValue;
-                }
-                if (path.len >= 256) {
-                    return error.StringConversionTooDeep;
-                }
-                try path.push(value);
-                defer path.len -= 1;
-                if (count > 0) {
-                    try buff.writeAll(" (");
-                    const data: [*]const Value = @ptrFromInt(value + 8);
-                    for (0..count) |idx| {
-                        if (idx != 0) {
-                            try buff.writeAll(", ");
-                        }
-                        try self.appendValueText(data[idx], buff, path);
-                    }
-                    try buff.writeByte(')');
-                }
-            } else {
-                return error.UnsupportedStringConversion;
-            }
-        }
     }
 
     fn referenceChecked(self: *Self, ref: Value) !*Value {
@@ -588,170 +495,73 @@ pub const Vm = struct {
                 },
                 Op.Sexp => {
                     const offset = try self.readNonNegativeI32(error.NegativeStringOffset);
-                    if (offset >= self.strings.len) {
-                        @branchHint(.unlikely);
-                        return error.StringOffsetOutOfBounds;
-                    }
-
                     const count = try self.readNonNegativeI32(error.NegativeSexpFieldCount);
-                    if (self.stack.len < self.frame.stack_base or
-                        count > self.stack.len - self.frame.stack_base)
-                    {
-                        @branchHint(.unlikely);
-                        return error.StackUnderflow;
-                    }
-
+                    if (offset >= self.strings.len) return error.StringOffsetOutOfBounds;
+                    if (count > self.stack.count() - self.frame.stack_base) return error.StackUnderflow;
                     const tail = self.strings[offset..];
                     const end = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
                     const name: [:0]const u8 = tail[0..end :0];
-                    const encoded: Value = @intCast(LtagHash(name.ptr));
-                    const tag = try unboxIntChecked(encoded);
-
-                    const object = try self.allocateObject(.sexp, count);
-                    const constructor_tag: *usize = @ptrFromInt(object);
-                    constructor_tag.* = @intCast(tag);
-                    const elements: [*]Value = @ptrFromInt(object + @sizeOf(Value));
-                    for (0..count) |i| {
-                        elements[count - 1 - i] = try self.stackPop();
-                    }
+                    const start = self.stack.count() - count;
+                    self.prepareRuntime();
+                    try self.stack.push(LtagHash(name.ptr));
+                    self.prepareRuntime();
+                    const object = Bsexp(self.stack.data[start..].ptr, boxInt(@intCast(count + 1)));
+                    self.stack.truncate(start);
                     try self.stack.push(object);
                 },
                 Op.String => {
                     const offset = try self.readNonNegativeI32(error.NegativeStringOffset);
-                    if (offset >= self.strings.len) {
-                        @branchHint(.unlikely);
-                        return error.StringOffsetOutOfBounds;
-                    }
+                    if (offset >= self.strings.len) return error.StringOffsetOutOfBounds;
                     const tail = self.strings[offset..];
-                    const end = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
-                    const bytes = tail[0..end];
-                    const value = try self.createString(bytes);
-                    try self.stack.push(value);
+                    _ = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
+                    const start = self.stack.count();
+                    try self.stack.push(@intFromPtr(tail.ptr));
+                    self.prepareRuntime();
+                    const object = Bstring(self.stack.data[start..].ptr);
+                    self.stack.data[start] = object;
                 },
                 Op.Length => {
-                    const value = try self.stackPop();
-                    const header = try self.objectHeaderChecked(value);
-                    const tag = header.data_header & 7;
-                    const length = header.data_header >> 3;
-
-                    if (tag == 1 or tag == 3 or tag == 5) {
-                        @branchHint(.likely);
-                        try self.stack.push(boxInt(@intCast(length)));
-                    } else {
-                        @branchHint(.unlikely);
-                        return error.ExpectedStringOrArray;
-                    }
+                    _ = try self.objectHeaderChecked(try self.stackHead());
+                    try self.unary(Llength);
                 },
                 Op.Array => {
-                    const elem_cnt = try self.readNonNegativeI32(error.NegativeArrayLength);
-                    if (self.stack.len < self.frame.stack_base or
-                        elem_cnt > self.stack.len - self.frame.stack_base)
-                    {
-                        @branchHint(.unlikely);
-                        return error.StackUnderflow;
-                    }
-                    const object = try self.allocateObject(.array, elem_cnt);
-                    const values: [*]Value = @ptrFromInt(object);
-                    for (0..elem_cnt) |i| {
-                        values[elem_cnt - 1 - i] = try self.stackPop();
-                    }
+                    const count = try self.readNonNegativeI32(error.NegativeArrayLength);
+                    if (count > self.stack.count() - self.frame.stack_base) return error.StackUnderflow;
+                    const start = self.stack.count() - count;
+                    self.prepareRuntime();
+                    const object = Barray(self.stack.data[start..].ptr, boxInt(@intCast(count)));
+                    self.stack.truncate(start);
                     try self.stack.push(object);
                 },
                 Op.ArrayPattern => {
-                    const args_cnt = try self.readNonNegativeI32(error.NegativeArrayLength);
-                    const value = try self.stackPop();
-
-                    var matches = false;
-
-                    if (isObject(value)) {
-                        const header = try self.objectHeaderChecked(value);
-                        matches = ((header.data_header & 7) == 3) and
-                            ((header.data_header >> 3) == args_cnt);
-                    }
-
-                    try self.stack.push(boxInt(@intFromBool(matches)));
+                    const count = try self.readNonNegativeI32(error.NegativeArrayLength);
+                    const value = try self.stackHead();
+                    const index = self.stack.count() - 1;
+                    self.prepareRuntime();
+                    self.stack.data[index] = if (isObject(value)) Barray_patt(value, boxInt(@intCast(count))) else boxInt(0);
                 },
-
                 Op.Elem => {
-                    const index = try unboxIntChecked(try self.stackPop());
-                    if (index < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeElementIndex;
-                    }
-                    const uindex: usize = @intCast(index);
-                    const object = try self.stackPop();
-
-                    const header = try self.objectHeaderChecked(object);
-                    const tag = header.data_header & 7;
-                    const length = header.data_header >> 3;
-
-                    if (tag != 1 and tag != 3 and tag != 5) {
-                        return error.ExpectedStringOrArray;
-                    }
-
-                    if (uindex >= length) {
-                        @branchHint(.unlikely);
-                        return error.ElementIndexOutOfBounds;
-                    }
-                    if (tag == 1) {
-                        const elements: [*]const u8 = @ptrFromInt(object);
-                        const value: u8 = elements[uindex];
-                        try self.stack.push(boxInt(@intCast(value)));
-                    } else if (tag == 3) {
-                        const elements: [*]const Value = @ptrFromInt(object);
-                        const value = elements[uindex];
-                        try self.stack.push(value);
-                    } else if (tag == 5) {
-                        const elements: [*]const Value = @ptrFromInt(object + @sizeOf(Value));
-                        try self.stack.push(elements[uindex]);
-                    }
+                    if (self.stack.count() - self.frame.stack_base < 2) return error.StackUnderflow;
+                    _ = try self.objectHeaderChecked(self.stack.data[self.stack.count() - 2]);
+                    try self.binary(Belem);
                 },
                 Op.StoreElement => {
-                    const new_value = try self.stackPop();
-                    const index_or_ref = try self.stackPop();
+                    if (self.stack.count() - self.frame.stack_base < 2) return error.StackUnderflow;
+                    const index_or_ref = self.stack.data[self.stack.count() - 2];
                     if ((index_or_ref & 1) == 0) {
+                        const new_value = try self.stackPop();
+                        _ = try self.stackPop();
                         const ptr = try self.referenceChecked(index_or_ref);
                         ptr.* = new_value;
                         try self.stack.push(new_value);
-                        continue;
-                    }
-                    const index = try unboxIntChecked(index_or_ref);
-                    if (index < 0) {
-                        @branchHint(.unlikely);
-                        return error.NegativeElementIndex;
-                    }
-                    const uindex: usize = @intCast(index);
-                    const object = try self.stackPop();
-
-                    const header = try self.objectHeaderChecked(object);
-                    const tag = header.data_header & 7;
-                    const length = header.data_header >> 3;
-
-                    if (tag != 1 and tag != 3 and tag != 5) {
-                        return error.ExpectedStringOrArray;
-                    }
-
-                    if (uindex >= length) {
-                        @branchHint(.unlikely);
-                        return error.ElementIndexOutOfBounds;
-                    }
-                    if (tag == 1) {
-                        const elements: [*]u8 = @ptrFromInt(object);
-                        const unew_value = try unboxIntChecked(new_value);
-                        if (unew_value < 0 or unew_value > 255) {
-                            @branchHint(.unlikely);
-                            return error.StringByteOutOfRange;
-                        }
-                        elements[uindex] = @intCast(unew_value);
-                        try self.stack.push(new_value);
-                    } else if (tag == 3) {
-                        const elements: [*]Value = @ptrFromInt(object);
-                        elements[uindex] = new_value;
-                        try self.stack.push(new_value);
-                    } else if (tag == 5) {
-                        const elements: [*]Value = @ptrFromInt(object + @sizeOf(Value));
-                        elements[uindex] = new_value;
-                        try self.stack.push(new_value);
+                    } else {
+                        if (self.stack.count() - self.frame.stack_base < 3) return error.StackUnderflow;
+                        const start = self.stack.count() - 3;
+                        _ = try self.objectHeaderChecked(self.stack.data[start]);
+                        self.prepareRuntime();
+                        const result = Bsta(self.stack.data[start], index_or_ref, self.stack.data[start + 2]);
+                        self.stack.truncate(start);
+                        try self.stack.push(result);
                     }
                 },
                 Op.LoadAddressGlobal => {
@@ -871,12 +681,12 @@ pub const Vm = struct {
                     const locals_count = try self.readNonNegativeI32(error.NegativeLocalCount);
 
                     if (self.call_stack.len == 0) {
-                        self.frame.args = try self.reserve(args_count);
+                        self.frame.args = try self.stack.reserve(args_count);
                     } else if (args_count != self.frame.args.len) {
                         return error.ArgumentCountMismatch;
                     }
-                    self.frame.locals = try self.reserve(locals_count);
-                    self.frame.stack_base = self.stack.len;
+                    self.frame.locals = try self.stack.reserve(locals_count);
+                    self.frame.stack_base = self.stack.count();
                 },
                 Op.Closure => {
                     const addr = try self.readNonNegativeI32(error.NegativeClosureAddress);
@@ -887,10 +697,10 @@ pub const Vm = struct {
                         return error.ClosureTargetNotFunction;
                     }
 
-                    const object = try self.allocateObject(.closure, count + 1);
-                    const function_addr: *usize = @ptrFromInt(object);
-                    function_addr.* = addr;
-                    const captures: [*]Value = @ptrFromInt(object + @sizeOf(Value));
+                    const start = self.stack.count();
+                    const fields = try self.stack.reserve(count + 1);
+                    fields[0] = addr;
+                    const captures = fields[1..];
 
                     for (0..count) |idx| {
                         const d: usize = @intCast(try self.readByte());
@@ -928,6 +738,9 @@ pub const Vm = struct {
                             else => return error.InvalidClosureCaptureScope,
                         }
                     }
+                    self.prepareRuntime();
+                    const object = Bclosure(fields.ptr, boxInt(@intCast(count)));
+                    self.stack.truncate(start);
                     try self.stack.push(object);
                 },
                 Op.Line => {
@@ -935,16 +748,18 @@ pub const Vm = struct {
                 },
                 Op.CallClosure => {
                     const count = try self.readNonNegativeI32(error.NegativeArgumentCount);
-                    if (self.stack.len < self.frame.stack_base or
-                        count + 1 > self.stack.len - self.frame.stack_base)
+                    if (self.stack.count() < self.frame.stack_base or
+                        count + 1 > self.stack.count() - self.frame.stack_base)
                     {
                         return error.StackUnderflow;
                     }
                     if (self.call_stack.len >= self.call_stack.data.len) return error.CallStackOverflow;
 
-                    const slot = self.stack.len - count - 1;
+                    const slot = self.stack.count() - count - 1;
+                    if (!isObject(self.stack.data[slot])) return error.ExpectedClosure;
+                    self.prepareRuntime();
+                    if (Bclosure_tag_patt(self.stack.data[slot]) == boxInt(0)) return error.ExpectedClosure;
                     const object = self.stack.data[slot];
-                    if (!isObject(object)) return error.ExpectedClosure;
                     const header = try self.objectHeaderChecked(object);
                     const length = header.data_header >> 3;
                     if ((header.data_header & 7) != 7) return error.ExpectedClosure;
@@ -959,10 +774,10 @@ pub const Vm = struct {
                     if (count != declared_args) return error.ArgumentCountMismatch;
 
                     const new_frame = Frame{
-                        .args = self.stack.data[slot + 1 .. self.stack.len],
+                        .args = self.stack.data[slot + 1 .. self.stack.count()],
                         .locals = &.{},
                         .closure = slot,
-                        .stack_base = self.stack.len,
+                        .stack_base = self.stack.count(),
                         .frame_start = slot,
                         .id = try self.nextFrameId(),
                     };
@@ -987,19 +802,19 @@ pub const Vm = struct {
                     );
                     if (declared_args < 0) return error.NegativeArgumentCount;
                     if (args_cnt != declared_args) return error.ArgumentCountMismatch;
-                    if (self.stack.len < self.frame.stack_base or
-                        args_cnt > self.stack.len - self.frame.stack_base)
+                    if (self.stack.count() < self.frame.stack_base or
+                        args_cnt > self.stack.count() - self.frame.stack_base)
                     {
                         return error.StackUnderflow;
                     }
                     if (self.call_stack.len >= self.call_stack.data.len) return error.CallStackOverflow;
 
-                    const start = self.stack.len - args_cnt;
+                    const start = self.stack.count() - args_cnt;
                     const new_frame = Frame{
-                        .args = self.stack.data[start..self.stack.len],
+                        .args = self.stack.data[start..self.stack.count()],
                         .locals = &.{},
                         .closure = null,
-                        .stack_base = self.stack.len,
+                        .stack_base = self.stack.count(),
                         .frame_start = start,
                         .id = try self.nextFrameId(),
                     };
@@ -1012,102 +827,65 @@ pub const Vm = struct {
                 Op.Tag => {
                     const offset = try self.readNonNegativeI32(error.NegativeStringOffset);
                     const count = try self.readNonNegativeI32(error.NegativeSexpFieldCount);
-
                     if (offset >= self.strings.len) return error.StringOffsetOutOfBounds;
-
                     const tail = self.strings[offset..];
                     const end = std.mem.findScalar(u8, tail, 0) orelse return error.UnterminatedString;
-
                     const name: [:0]const u8 = tail[0..end :0];
-                    const encoded: Value = @intCast(LtagHash(name.ptr));
-                    const tag = try unboxIntChecked(encoded);
-                    const value = try self.stackPop();
-
-                    var matches = false;
-                    if (isObject(value)) {
-                        const header = try self.objectHeaderChecked(value);
-                        if ((header.data_header & 7) == 5) {
-                            const constructor_tag: *const usize = @ptrFromInt(value);
-                            const expected_tag: usize = @intCast(tag);
-
-                            matches = ((header.data_header >> 3) == count) and
-                                (constructor_tag.* == expected_tag);
-                        }
-                    }
-                    try self.stack.push(boxInt(@intFromBool(matches)));
+                    self.prepareRuntime();
+                    const tag = LtagHash(name.ptr);
+                    const value = try self.stackHead();
+                    const index = self.stack.count() - 1;
+                    self.prepareRuntime();
+                    self.stack.data[index] = if (isObject(value)) Btag(value, tag, boxInt(@intCast(count))) else boxInt(0);
                 },
                 Op.StringEqual => {
-                    const right = try self.stackPop();
-                    const left = try self.stackPop();
-
-                    var matches = false;
-                    if (isObject(left) and isObject(right)) {
-                        const header_l = try self.objectHeaderChecked(left);
-                        const header_r = try self.objectHeaderChecked(right);
-
-                        if ((header_l.data_header & 7) == 1 and
-                            (header_r.data_header & 7) == 1)
-                        {
-                            const data_l: [*]const u8 = @ptrFromInt(left);
-                            const data_r: [*]const u8 = @ptrFromInt(right);
-
-                            const bytes_l = data_l[0 .. header_l.data_header >> 3];
-                            const bytes_r = data_r[0 .. header_r.data_header >> 3];
-
-                            if (std.mem.eql(u8, bytes_l, bytes_r)) {
-                                matches = true;
-                            }
-                        }
+                    if (self.stack.count() - self.frame.stack_base < 2) return error.StackUnderflow;
+                    const index = self.stack.count() - 2;
+                    const left = self.stack.data[index];
+                    const right = self.stack.data[index + 1];
+                    if (isObject(left) and isObject(right) and
+                        ((try self.objectHeaderChecked(left)).data_header & 7) == 1 and
+                        ((try self.objectHeaderChecked(right)).data_header & 7) == 1)
+                    {
+                        try self.binary(Bstring_patt);
+                    } else {
+                        self.stack.truncate(index + 1);
+                        self.stack.data[index] = boxInt(0);
                     }
-                    try self.stack.push(boxInt(@intFromBool(matches)));
                 },
                 Op.IsString => {
-                    const value = try self.stackPop();
-                    var matches = false;
-
-                    if (isObject(value)) {
-                        const header = try self.objectHeaderChecked(value);
-                        matches = (header.data_header & 7) == 1;
+                    if (isObject(try self.stackHead())) {
+                        try self.unary(Bstring_tag_patt);
+                    } else {
+                        self.stack.data[self.stack.count() - 1] = boxInt(0);
                     }
-                    try self.stack.push(boxInt(@intFromBool(matches)));
                 },
                 Op.IsArray => {
-                    const value = try self.stackPop();
-                    var matches = false;
-
-                    if (isObject(value)) {
-                        const header = try self.objectHeaderChecked(value);
-                        matches = (header.data_header & 7) == 3;
+                    if (isObject(try self.stackHead())) {
+                        try self.unary(Barray_tag_patt);
+                    } else {
+                        self.stack.data[self.stack.count() - 1] = boxInt(0);
                     }
-                    try self.stack.push(boxInt(@intFromBool(matches)));
                 },
                 Op.IsSexp => {
-                    const value = try self.stackPop();
-                    var matches = false;
-
-                    if (isObject(value)) {
-                        const header = try self.objectHeaderChecked(value);
-                        matches = (header.data_header & 7) == 5;
+                    if (isObject(try self.stackHead())) {
+                        try self.unary(Bsexp_tag_patt);
+                    } else {
+                        self.stack.data[self.stack.count() - 1] = boxInt(0);
                     }
-                    try self.stack.push(boxInt(@intFromBool(matches)));
                 },
                 Op.IsClosure => {
-                    const value = try self.stackPop();
-                    var matches = false;
-
-                    if (isObject(value)) {
-                        const header = try self.objectHeaderChecked(value);
-                        matches = (header.data_header & 7) == 7;
+                    if (isObject(try self.stackHead())) {
+                        try self.unary(Bclosure_tag_patt);
+                    } else {
+                        self.stack.data[self.stack.count() - 1] = boxInt(0);
                     }
-                    try self.stack.push(boxInt(@intFromBool(matches)));
                 },
                 Op.IsBoxed => {
-                    const value = try self.stackPop();
-                    try self.stack.push(boxInt(@intFromBool((value & 1) == 0)));
+                    try self.unary(Bboxed_patt);
                 },
                 Op.IsUnboxed => {
-                    const value = try self.stackPop();
-                    try self.stack.push(boxInt(@intFromBool((value & 1) != 0)));
+                    try self.unary(Bunboxed_patt);
                 },
                 Op.Fail => {
                     const row = try self.readNonNegativeI32(error.InvalidSourceLocation);
@@ -1127,10 +905,10 @@ pub const Vm = struct {
                     }
                     const last_frame = try self.call_stack.pop();
                     var possibleReturnValue: ?Value = null;
-                    if (self.stack.len > self.frame.stack_base) {
+                    if (self.stack.count() > self.frame.stack_base) {
                         possibleReturnValue = try self.stackPop();
                     }
-                    self.stack.len = self.frame.frame_start;
+                    self.stack.truncate(self.frame.frame_start);
                     self.ip = last_frame.return_ip;
                     self.frame = last_frame.frame;
                     if (possibleReturnValue) |v| {
@@ -1185,32 +963,18 @@ pub const Vm = struct {
                     self.frame.locals[idx] = try self.stackHead();
                 },
                 Op.Read => {
-                    try self.stack.push(boxInt(try self.readInputInteger()));
+                    self.prepareRuntime();
+                    try self.stack.push(Lread());
                 },
                 Op.Write => {
-                    const value = try self.stackPop();
-                    if ((value & 1) == 0) {
-                        @branchHint(.unlikely);
-                        return error.ExpectedInteger;
-                    }
-                    var buffer: [64]u8 = undefined;
-                    const text = try std.fmt.bufPrint(
-                        &buffer,
-                        "{d}\n",
-                        .{try unboxIntChecked(value)},
-                    );
-                    try std.Io.File.stdout().writeStreamingAll(self.io, text);
-                    try self.stack.push(0);
+                    try self.unary(Lwrite);
                 },
                 Op.ToString => {
-                    const value = try self.stackPop();
-                    var buff: std.Io.Writer = .fixed(&string_buffer);
-                    var path = Stack(Value, 256).init();
-                    self.appendValueText(value, &buff, &path) catch |err| {
-                        return if (err == error.WriteFailed) error.StringConversionTooLarge else err;
-                    };
-                    const str = try self.createString(buff.buffered());
-                    try self.stack.push(str);
+                    _ = try self.stackHead();
+                    const index = self.stack.count() - 1;
+                    if ((self.stack.data[index] & 1) == 0) _ = try self.objectHeaderChecked(self.stack.data[index]);
+                    self.prepareRuntime();
+                    self.stack.data[index] = Lstring(self.stack.data[index..].ptr);
                 },
                 else => return error.InvalidOpcode,
             }
@@ -1219,13 +983,13 @@ pub const Vm = struct {
 };
 
 pub fn checkBytecodeHeaders(bytes: []const u8) !ByteCode {
-    if (bytes.len < 12) {
+    if (bytes.len < bytecode_header_size) {
         return error.TruncatedBytecodeHeader;
     }
 
     const strings_size = std.mem.readInt(i32, bytes[0..4], .little);
     const globals_count = std.mem.readInt(i32, bytes[4..8], .little);
-    const public_count = std.mem.readInt(i32, bytes[8..12], .little);
+    const public_count = std.mem.readInt(i32, bytes[8..bytecode_header_size], .little);
 
     if (strings_size < 0 or globals_count < 0 or public_count < 0) {
         return error.NegativeHeaderField;
@@ -1233,23 +997,24 @@ pub fn checkBytecodeHeaders(bytes: []const u8) !ByteCode {
 
     const pubs: usize = @intCast(public_count);
     const strs: usize = @intCast(strings_size);
-    const remaining = bytes.len - 12;
+    const remaining = bytes.len - bytecode_header_size;
 
-    if (pubs > remaining / 9) {
+    if (pubs > remaining / public_symbol_size) {
         return error.TruncatedPublicSymbolTable;
     }
 
-    const public_size = pubs * 9;
+    const public_size = pubs * public_symbol_size;
     if (strs > remaining - public_size) {
         return error.TruncatedStringTable;
     }
 
-    const strings_start = 12 + public_size;
+    const strings_start = bytecode_header_size + public_size;
     const strings = bytes[strings_start .. strings_start + strs];
     const code_size = remaining - public_size - strs;
+    var entry_point: usize = 0;
 
     for (0..pubs) |idx| {
-        const offset = 12 + idx * 9;
+        const offset = bytecode_header_size + idx * public_symbol_size;
         const string_idx = std.mem.readInt(i32, bytes[offset..][0..4], .little);
         const global_or_fun_idx = std.mem.readInt(i32, bytes[offset + 4 ..][0..4], .little);
         const symb_type = std.mem.readInt(u8, bytes[offset + 8 ..][0..1], .little);
@@ -1262,9 +1027,8 @@ pub fn checkBytecodeHeaders(bytes: []const u8) !ByteCode {
         if (string_idx < 0 or string_idx >= strings_size) {
             return error.PublicSymbolNameOffsetOutOfBounds;
         }
-        if (std.mem.findScalar(u8, strings[@intCast(string_idx)..], 0) == null) {
-            return error.UnterminatedPublicSymbolName;
-        }
+        const name = strings[@intCast(string_idx)..];
+        const name_end = std.mem.findScalar(u8, name, 0) orelse return error.UnterminatedPublicSymbolName;
 
         if (global_or_fun_idx < 0) {
             return error.NegativePublicSymbolOffset;
@@ -1273,12 +1037,13 @@ pub fn checkBytecodeHeaders(bytes: []const u8) !ByteCode {
             if (@as(usize, @intCast(global_or_fun_idx)) >= code_size) {
                 return error.PublicFunctionAddressOutOfBounds;
             }
+            if (std.mem.eql(u8, name[0..name_end], "main")) entry_point = @intCast(global_or_fun_idx);
         } else if (global_or_fun_idx >= globals_count) {
             return error.PublicGlobalIndexOutOfBounds;
         }
     }
-    const code_start = 12 + pubs * 9 + strs;
-    return ByteCode{ .code = bytes[code_start..], .globals_count = @intCast(globals_count), .strings = strings };
+    const code_start = bytecode_header_size + public_size + strs;
+    return ByteCode{ .code = bytes[code_start..], .globals_count = @intCast(globals_count), .strings = strings, .entry_point = entry_point };
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -1299,33 +1064,18 @@ pub fn main(init: std.process.Init) !void {
 
     const byteCode = try checkBytecodeHeaders(bytes);
 
-    const instruction_starts = try markInstructionStarts(byteCode.code);
-    const public_count: usize = @intCast(std.mem.readInt(i32, bytes[8..12], .little));
-    for (0..public_count) |idx| {
-        const offset = 12 + idx * 9;
-        if (bytes[offset + 8] != 0) continue;
-        const addr: usize = @intCast(std.mem.readInt(i32, bytes[offset + 4 ..][0..4], .little));
-        if (!instruction_starts[addr]) {
-            return error.PublicFunctionTargetNotInstructionStart;
-        }
-        if (byteCode.code[addr] != 0x52 and byteCode.code[addr] != 0x53) {
-            return error.PublicFunctionTargetNotFunction;
-        }
-    }
-
     const anchor: *volatile usize = &gc_anchor;
     _ = anchor.*;
     __init();
     defer __shutdown();
+    var operand_storage: [stack_size * 8]Value align(16) = undefined;
     vm = Vm{
         .code = byteCode.code,
-        .instruction_starts = instruction_starts,
         .strings = byteCode.strings,
-        .ip = 0,
+        .ip = byteCode.entry_point,
         .globals = &.{},
         .current_line = null,
-        .io = init.io,
-        .stack = .init(),
+        .stack = .init(&operand_storage),
         .call_stack = .init(),
         .frame = .{
             .args = &.{},
@@ -1336,9 +1086,8 @@ pub fn main(init: std.process.Init) !void {
             .id = 1,
         },
     };
-    try vm.stack.push(0);
-    vm.globals = try vm.reserve(byteCode.globals_count);
-    vm.frame.frame_start = vm.stack.len;
-    vm.frame.stack_base = vm.stack.len;
+    vm.globals = try vm.stack.reserve(byteCode.globals_count);
+    vm.frame.frame_start = vm.stack.count();
+    vm.frame.stack_base = vm.stack.count();
     try vm.run();
 }
