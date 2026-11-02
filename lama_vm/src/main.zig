@@ -45,10 +45,6 @@ inline fn boxInt(n: isize) Value {
     return (@as(usize, @bitCast(n)) << 1) | 1;
 }
 
-inline fn unboxIntUnchecked(value: Value) isize {
-    return @as(isize, @bitCast(value)) >> 1;
-}
-
 inline fn unboxIntChecked(value: Value) !isize {
     if ((value & 1) == 0) {
         @branchHint(.unlikely);
@@ -71,14 +67,6 @@ pub fn Stack(comptime T: type, comptime capacity: usize) type {
                 .len = 0,
                 .data = undefined,
             };
-        }
-
-        pub fn head(self: *Self) !T {
-            if (self.len == 0) {
-                @branchHint(.unlikely);
-                return error.StackUnderflow;
-            }
-            return self.data[self.len - 1];
         }
 
         pub fn push(self: *Self, element: T) !void {
